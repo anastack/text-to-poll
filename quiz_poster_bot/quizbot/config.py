@@ -16,6 +16,7 @@ def _as_bool(v: str, *, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class Config:
     bot_token: str
+    target_channel_id: str | None
     admin_user_id: int | None
     photo_ttl_seconds: int
     poll_anonymous: bool
@@ -28,6 +29,8 @@ def load_config() -> Config:
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     if not bot_token:
         raise RuntimeError("BOT_TOKEN is required. Put it into quiz_poster_bot/.env")
+
+    target_channel_id = os.getenv("TARGET_CHANNEL_ID", "").strip() or None
 
     admin_user_id_raw = os.getenv("ADMIN_USER_ID", "").strip()
     admin_user_id: int | None
@@ -50,6 +53,7 @@ def load_config() -> Config:
 
     return Config(
         bot_token=bot_token,
+        target_channel_id=target_channel_id,
         admin_user_id=admin_user_id,
         photo_ttl_seconds=photo_ttl_seconds,
         poll_anonymous=poll_anonymous,

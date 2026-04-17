@@ -6,6 +6,7 @@ __pycache__/
 .env
 quiz_poster_bot/.env
 quiz_poster_bot/channel_selections.json
+quiz_poster_bot/scheduled_quizzes.json
 
 .railway/
 .idea/
