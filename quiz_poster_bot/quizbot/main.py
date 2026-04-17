@@ -9,7 +9,7 @@ import time
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .config import load_config
 from .parser import ParseError, parse_quiz_block_text, parse_quiz_text
@@ -24,6 +24,12 @@ def _is_allowed(m: Message, admin_user_id: int | None) -> bool:
     if admin_user_id is None:
         return True
     return bool(m.from_user and m.from_user.id == admin_user_id)
+
+
+def _is_callback_allowed(c: CallbackQuery, admin_user_id: int | None) -> bool:
+    if admin_user_id is None:
+        return True
+    return c.from_user.id == admin_user_id
 
 
 def _normalize_channel_id(text: str) -> str | None:
@@ -81,6 +87,77 @@ def _looks_like_block(text: str) -> bool:
         or re.search(r"(?m)^\s*---+\s*$", normalized)
         or re.search(r"\n\s*\n", normalized)
     )
+
+
+def _main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Создать блок", callback_data="menu:block"),
+                InlineKeyboardButton(text="Отложить", callback_data="menu:schedule"),
+            ],
+            [
+                InlineKeyboardButton(text="Очередь", callback_data="menu:scheduled"),
+                InlineKeyboardButton(text="Канал", callback_data="menu:channel"),
+            ],
+            [InlineKeyboardButton(text="Помощь", callback_data="menu:help")],
+        ]
+    )
+
+
+def _cancel_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu:cancel")]]
+    )
+
+
+def _delay_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Через 10 минут", callback_data="schedule:600"),
+                InlineKeyboardButton(text="Через 1 час", callback_data="schedule:3600"),
+            ],
+            [
+                InlineKeyboardButton(text="Через 3 часа", callback_data="schedule:10800"),
+                InlineKeyboardButton(text="Завтра", callback_data="schedule:86400"),
+            ],
+            [InlineKeyboardButton(text="Отмена", callback_data="menu:cancel")],
+        ]
+    )
+
+
+def _help_text() -> str:
+    return (
+        "Формат одного вопроса:\n"
+        "1-я строка - вопрос\n"
+        "дальше - варианты ответа (2-10)\n"
+        "правильный вариант: * или + в начале строки\n\n"
+        "Блок вопросов:\n"
+        "/block Тема\n"
+        "Вопрос 1?\n"
+        "*Ответ\n"
+        "Другой ответ\n\n"
+        "Вопрос 2?\n"
+        "*Ответ\n"
+        "Другой ответ\n\n"
+        "Отложенная отправка:\n"
+        "/schedule 10m Тема\n"
+        "и дальше такой же блок вопросов.\n\n"
+        "Вопросы можно разделять пустой строкой или строкой ---."
+    )
+
+
+def _scheduled_text(schedule_store: ScheduledQuizStore) -> str:
+    jobs = schedule_store.list_all()
+    if not jobs:
+        return "Отложенных блоков пока нет."
+
+    lines = ["Отложенные блоки:"]
+    for job in jobs:
+        topic = f" - {job.topic}" if job.topic else ""
+        lines.append(f"{job.id[:8]}: {_format_when(job.send_at)}{topic} -> {job.channel_id}")
+    return "\n".join(lines)
 
 
 async def _ask_channel_id(m: Message) -> None:
@@ -232,6 +309,7 @@ def build_router(
 ) -> Router:
     router = Router()
     users_waiting_for_channel: set[int] = set()
+    pending_actions: dict[int, dict[str, object]] = {}
 
     async def ensure_channel(m: Message) -> str | None:
         if not m.from_user:
@@ -244,6 +322,62 @@ def build_router(
         users_waiting_for_channel.add(m.from_user.id)
         await _ask_channel_id(m)
         return None
+
+    async def publish_block_from_text(
+        *,
+        m: Message,
+        channel_id: str,
+        text: str,
+        topic: str | None,
+    ) -> None:
+        photo_file_id = photo_cache.pop_if_fresh(m.from_user.id)
+        try:
+            msg = await _post_quiz_block(
+                bot=bot,
+                channel_id=channel_id,
+                question_text=text,
+                topic=topic,
+                photo_file_id=photo_file_id,
+                poll_anonymous=cfg.poll_anonymous,
+                poll_multiple_answers=cfg.poll_multiple_answers,
+            )
+        except ParseError as e:
+            await m.answer(f"Не смог разобрать блок: {e}", reply_markup=_main_menu())
+            return
+        await m.answer(msg, reply_markup=_main_menu())
+
+    async def schedule_block_from_text(
+        *,
+        m: Message,
+        channel_id: str,
+        text: str,
+        delay_seconds: int,
+        topic: str | None,
+    ) -> None:
+        photo_file_id = photo_cache.pop_if_fresh(m.from_user.id)
+        try:
+            block = parse_quiz_block_text(text, topic=topic)
+        except ParseError as e:
+            await m.answer(f"Не смог разобрать блок: {e}", reply_markup=_main_menu())
+            return
+
+        job = schedule_store.add(
+            user_id=m.from_user.id,
+            channel_id=channel_id,
+            question_text=text,
+            topic=block.topic,
+            photo_file_id=photo_file_id,
+            send_at=time.time() + delay_seconds,
+        )
+        _schedule_job_task(bot=bot, job=job, schedule_store=schedule_store, cfg=cfg)
+
+        await m.answer(
+            f"Поставил в очередь {len(block.quizzes)} вопросов"
+            f"{f' по теме «{block.topic}»' if block.topic else ''}.\n"
+            f"Отправка: {_format_when(job.send_at)}.\n"
+            f"ID задачи: {job.id[:8]}",
+            reply_markup=_main_menu(),
+        )
 
     @router.message(CommandStart())
     async def start(m: Message) -> None:
@@ -262,17 +396,8 @@ def build_router(
         await m.answer(
             f"Текущий канал: {channel_id}\n\n"
             "Один вопрос можно отправить обычным сообщением: вопрос и варианты с новой строки, правильный вариант пометьте * или +.\n\n"
-            "Блок вопросов:\n"
-            "/block История\n"
-            "Тема: История\n"
-            "Вопрос 1?\n"
-            "*Верный ответ\n"
-            "Ответ 2\n\n"
-            "Вопрос 2?\n"
-            "*Верный ответ\n"
-            "Ответ 2\n\n"
-            "Отложить блок: /schedule 10m История\n"
-            "Единицы времени: 30s, 10m, 2h, 1d. Канал меняется командой /channel."
+            "Для блоков, отложенной отправки и очереди используйте кнопки ниже.",
+            reply_markup=_main_menu(),
         )
 
     @router.message(Command("channel"))
@@ -282,45 +407,120 @@ def build_router(
         if not m.from_user:
             return
 
+        pending_actions.pop(m.from_user.id, None)
         users_waiting_for_channel.add(m.from_user.id)
         await _ask_channel_id(m)
 
     @router.message(Command("help"))
     async def help_cmd(m: Message) -> None:
-        await m.answer(
-            "Формат одного вопроса:\n"
-            "1-я строка - вопрос\n"
-            "дальше - варианты ответа (2-10)\n"
-            "правильный вариант: * или + в начале строки\n\n"
-            "Блок вопросов:\n"
-            "/block Тема\n"
-            "Вопрос 1?\n"
-            "*Ответ\n"
-            "Другой ответ\n\n"
-            "Вопрос 2?\n"
-            "*Ответ\n"
-            "Другой ответ\n\n"
-            "Отложенная отправка:\n"
-            "/schedule 10m Тема\n"
-            "и дальше такой же блок вопросов.\n\n"
-            "Вопросы можно разделять пустой строкой или строкой ---."
-        )
+        await m.answer(_help_text(), reply_markup=_main_menu())
 
     @router.message(Command("scheduled"))
     async def scheduled_cmd(m: Message) -> None:
         if not _is_allowed(m, cfg.admin_user_id):
             return
 
-        jobs = schedule_store.list_all()
-        if not jobs:
-            await m.answer("Отложенных блоков пока нет.")
+        await m.answer(_scheduled_text(schedule_store), reply_markup=_main_menu())
+
+    @router.callback_query(F.data == "menu:block")
+    async def menu_block(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+        if not c.from_user:
+            await c.answer()
             return
 
-        lines = ["Отложенные блоки:"]
-        for job in jobs:
-            topic = f" - {job.topic}" if job.topic else ""
-            lines.append(f"{job.id[:8]}: {_format_when(job.send_at)}{topic} -> {job.channel_id}")
-        await m.answer("\n".join(lines))
+        pending_actions[c.from_user.id] = {"mode": "block"}
+        await c.message.answer(
+            "Пришлите блок вопросов одним сообщением.\n\n"
+            "Тему можно написать первой строкой, например:\n"
+            "Тема: История\n\n"
+            "Вопросы разделяйте пустой строкой или строкой ---.",
+            reply_markup=_cancel_menu(),
+        )
+        await c.answer()
+
+    @router.callback_query(F.data == "menu:schedule")
+    async def menu_schedule(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        await c.message.answer("Через сколько отправить блок?", reply_markup=_delay_menu())
+        await c.answer()
+
+    @router.callback_query(F.data.startswith("schedule:"))
+    async def menu_schedule_delay(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+        if not c.from_user:
+            await c.answer()
+            return
+
+        raw_delay = (c.data or "").split(":", 1)[1]
+        try:
+            delay_seconds = int(raw_delay)
+        except ValueError:
+            await c.message.answer("Не понял задержку. Попробуйте еще раз.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        pending_actions[c.from_user.id] = {"mode": "schedule", "delay_seconds": delay_seconds}
+        await c.message.answer(
+            "Теперь пришлите блок вопросов одним сообщением.\n\n"
+            "Тему можно написать первой строкой, например:\n"
+            "Тема: История",
+            reply_markup=_cancel_menu(),
+        )
+        await c.answer()
+
+    @router.callback_query(F.data == "menu:scheduled")
+    async def menu_scheduled(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        await c.message.answer(_scheduled_text(schedule_store), reply_markup=_main_menu())
+        await c.answer()
+
+    @router.callback_query(F.data == "menu:channel")
+    async def menu_channel(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+        if not c.from_user:
+            await c.answer()
+            return
+
+        pending_actions.pop(c.from_user.id, None)
+        users_waiting_for_channel.add(c.from_user.id)
+        await c.message.answer(
+            "Пришлите новый ID канала: -1001234567890 или @your_public_channel.",
+            reply_markup=_cancel_menu(),
+        )
+        await c.answer()
+
+    @router.callback_query(F.data == "menu:help")
+    async def menu_help(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        await c.message.answer(_help_text(), reply_markup=_main_menu())
+        await c.answer()
+
+    @router.callback_query(F.data == "menu:cancel")
+    async def menu_cancel(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+        if c.from_user:
+            pending_actions.pop(c.from_user.id, None)
+            users_waiting_for_channel.discard(c.from_user.id)
+        await c.message.answer("Ок, отменил текущее действие.", reply_markup=_main_menu())
+        await c.answer()
 
     @router.message(Command("block"))
     async def block_cmd(m: Message, bot: Bot) -> None:
@@ -329,6 +529,7 @@ def build_router(
         if not m.from_user:
             return
 
+        pending_actions.pop(m.from_user.id, None)
         channel_id = await ensure_channel(m)
         if not channel_id:
             return
@@ -336,24 +537,13 @@ def build_router(
         header, body = _split_command_payload(m.text or "")
         topic = _command_tail(header) or None
         if not body:
-            await m.answer("После /block добавьте блок вопросов. Например: /block История, а ниже вопросы.")
+            await m.answer(
+                "После /block добавьте блок вопросов. Например: /block История, а ниже вопросы.",
+                reply_markup=_main_menu(),
+            )
             return
 
-        photo_file_id = photo_cache.pop_if_fresh(m.from_user.id)
-        try:
-            msg = await _post_quiz_block(
-                bot=bot,
-                channel_id=channel_id,
-                question_text=body,
-                topic=topic,
-                photo_file_id=photo_file_id,
-                poll_anonymous=cfg.poll_anonymous,
-                poll_multiple_answers=cfg.poll_multiple_answers,
-            )
-        except ParseError as e:
-            await m.answer(f"Не смог разобрать блок: {e}")
-            return
-        await m.answer(msg)
+        await publish_block_from_text(m=m, channel_id=channel_id, text=body, topic=topic)
 
     @router.message(Command("schedule"))
     async def schedule_cmd(m: Message) -> None:
@@ -362,6 +552,7 @@ def build_router(
         if not m.from_user:
             return
 
+        pending_actions.pop(m.from_user.id, None)
         channel_id = await ensure_channel(m)
         if not channel_id:
             return
@@ -371,39 +562,27 @@ def build_router(
         if not args or not body:
             await m.answer(
                 "Формат: /schedule 10m Тема\n"
-                "Ниже добавьте блок вопросов. Время можно указать как 30s, 10m, 2h или 1d."
+                "Ниже добавьте блок вопросов. Время можно указать как 30s, 10m, 2h или 1d.",
+                reply_markup=_main_menu(),
             )
             return
 
         parts = args.split(maxsplit=1)
         delay_seconds = _parse_delay(parts[0])
         if delay_seconds is None:
-            await m.answer("Не понял время. Используйте формат 30s, 10m, 2h или 1d.")
+            await m.answer(
+                "Не понял время. Используйте формат 30s, 10m, 2h или 1d.",
+                reply_markup=_main_menu(),
+            )
             return
 
         topic = parts[1].strip() if len(parts) > 1 else None
-        photo_file_id = photo_cache.pop_if_fresh(m.from_user.id)
-        try:
-            block = parse_quiz_block_text(body, topic=topic)
-        except ParseError as e:
-            await m.answer(f"Не смог разобрать блок: {e}")
-            return
-
-        job = schedule_store.add(
-            user_id=m.from_user.id,
+        await schedule_block_from_text(
+            m=m,
             channel_id=channel_id,
-            question_text=body,
-            topic=block.topic,
-            photo_file_id=photo_file_id,
-            send_at=time.time() + delay_seconds,
-        )
-        _schedule_job_task(bot=bot, job=job, schedule_store=schedule_store, cfg=cfg)
-
-        await m.answer(
-            f"Поставил в очередь {len(block.quizzes)} вопросов"
-            f"{f' по теме «{block.topic}»' if block.topic else ''}.\n"
-            f"Отправка: {_format_when(job.send_at)}.\n"
-            f"ID задачи: {job.id[:8]}"
+            text=body,
+            delay_seconds=delay_seconds,
+            topic=topic,
         )
 
     @router.message(F.photo)
@@ -468,13 +647,34 @@ def build_router(
             users_waiting_for_channel.discard(m.from_user.id)
             await m.answer(
                 f"Канал сохранен: {channel_id}\n"
-                "Теперь он используется по умолчанию. Чтобы заменить канал, отправьте /channel."
+                "Теперь он используется по умолчанию. Чтобы заменить канал, отправьте /channel.",
+                reply_markup=_main_menu(),
             )
             return
 
         channel_id = await ensure_channel(m)
         if not channel_id:
             return
+
+        pending = pending_actions.pop(m.from_user.id, None)
+        if pending:
+            mode = pending.get("mode")
+            if mode == "block":
+                await publish_block_from_text(m=m, channel_id=channel_id, text=text, topic=None)
+                return
+            if mode == "schedule":
+                delay_seconds = int(pending.get("delay_seconds", 0))
+                if delay_seconds <= 0:
+                    await m.answer("Не понял задержку. Попробуйте еще раз.", reply_markup=_main_menu())
+                    return
+                await schedule_block_from_text(
+                    m=m,
+                    channel_id=channel_id,
+                    text=text,
+                    delay_seconds=delay_seconds,
+                    topic=None,
+                )
+                return
 
         photo_file_id = photo_cache.pop_if_fresh(m.from_user.id)
         try:
@@ -514,6 +714,17 @@ async def main() -> None:
     cfg = load_config()
     bot = Bot(token=cfg.bot_token)
     dp = Dispatcher()
+
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Открыть меню"),
+            BotCommand(command="help", description="Показать формат вопросов"),
+            BotCommand(command="block", description="Опубликовать блок вопросов"),
+            BotCommand(command="schedule", description="Отложить блок вопросов"),
+            BotCommand(command="scheduled", description="Показать очередь"),
+            BotCommand(command="channel", description="Сменить канал"),
+        ]
+    )
 
     base_path = Path(__file__).resolve().parent.parent
     photo_cache = PhotoCache(ttl_seconds=cfg.photo_ttl_seconds)
