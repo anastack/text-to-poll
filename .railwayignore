@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+bot.err.log
+bot.log
+quiz_poster_bot/.env
+quiz_poster_bot/channel_selections.json
+.env
+.git/

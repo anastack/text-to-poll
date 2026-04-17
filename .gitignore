@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+
+.env
+quiz_poster_bot/.env
+quiz_poster_bot/channel_selections.json
+
+.railway/
+.idea/
+.vscode/
