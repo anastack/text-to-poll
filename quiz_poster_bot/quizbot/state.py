@@ -62,6 +62,12 @@ class ChannelSelectionStore:
 
 
 @dataclass(frozen=True)
+class ScheduledQuizQuestion:
+    text: str
+    photo_file_id: str | None = None
+
+
+@dataclass(frozen=True)
 class ScheduledQuizJob:
     id: str
     user_id: int
@@ -69,6 +75,8 @@ class ScheduledQuizJob:
     question_text: str
     topic: str | None
     photo_file_id: str | None
+    intro_text: str | None
+    questions: list[ScheduledQuizQuestion]
     send_at: float
     created_at: float
 
@@ -87,6 +95,8 @@ class ScheduledQuizStore:
         topic: str | None,
         photo_file_id: str | None,
         send_at: float,
+        intro_text: str | None = None,
+        questions: list[ScheduledQuizQuestion] | None = None,
     ) -> ScheduledQuizJob:
         job = ScheduledQuizJob(
             id=uuid4().hex,
@@ -95,6 +105,8 @@ class ScheduledQuizStore:
             question_text=question_text,
             topic=topic,
             photo_file_id=photo_file_id,
+            intro_text=intro_text,
+            questions=questions or [],
             send_at=send_at,
             created_at=time.time(),
         )
@@ -129,9 +141,20 @@ class ScheduledQuizStore:
                     id=str(item["id"]),
                     user_id=int(item["user_id"]),
                     channel_id=str(item["channel_id"]),
-                    question_text=str(item["question_text"]),
+                    question_text=str(item.get("question_text", "")),
                     topic=str(item["topic"]) if item.get("topic") else None,
                     photo_file_id=str(item["photo_file_id"]) if item.get("photo_file_id") else None,
+                    intro_text=str(item["intro_text"]) if item.get("intro_text") else None,
+                    questions=[
+                        ScheduledQuizQuestion(
+                            text=str(question["text"]),
+                            photo_file_id=str(question["photo_file_id"])
+                            if question.get("photo_file_id")
+                            else None,
+                        )
+                        for question in item.get("questions", [])
+                        if isinstance(question, dict) and question.get("text")
+                    ],
                     send_at=float(item["send_at"]),
                     created_at=float(item.get("created_at", time.time())),
                 )
@@ -150,6 +173,14 @@ class ScheduledQuizStore:
                 "question_text": job.question_text,
                 "topic": job.topic,
                 "photo_file_id": job.photo_file_id,
+                "intro_text": job.intro_text,
+                "questions": [
+                    {
+                        "text": question.text,
+                        "photo_file_id": question.photo_file_id,
+                    }
+                    for question in job.questions
+                ],
                 "send_at": job.send_at,
                 "created_at": job.created_at,
             }

@@ -13,7 +13,13 @@ from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, Inlin
 
 from .config import load_config
 from .parser import ParseError, parse_quiz_block_text, parse_quiz_text
-from .state import ChannelSelectionStore, PhotoCache, ScheduledQuizJob, ScheduledQuizStore
+from .state import (
+    ChannelSelectionStore,
+    PhotoCache,
+    ScheduledQuizJob,
+    ScheduledQuizQuestion,
+    ScheduledQuizStore,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +50,37 @@ def _normalize_channel_id(text: str) -> str | None:
 
 
 def _parse_delay(raw: str) -> int | None:
+    normalized = raw.strip().lower()
+    normalized = re.sub(r"^\s*через\s+", "", normalized)
+    word_delays = {
+        "час": 60 * 60,
+        "один час": 60 * 60,
+        "два часа": 2 * 60 * 60,
+        "три часа": 3 * 60 * 60,
+        "полчаса": 30 * 60,
+        "завтра": 24 * 60 * 60,
+    }
+    if normalized in word_delays:
+        return word_delays[normalized]
+
+    ru_match = re.match(
+        r"^\s*(\d+)\s*(сек|секунд[уы]?|с|мин|минут[уы]?|м|час(?:а|ов)?|ч|дн(?:я|ей)?|день|д)\s*$",
+        normalized,
+    )
+    if ru_match:
+        value = int(ru_match.group(1))
+        unit = ru_match.group(2)
+        if value <= 0:
+            return None
+        if unit.startswith(("сек", "с")):
+            return value
+        if unit.startswith(("мин", "м")):
+            return value * 60
+        if unit.startswith(("час", "ч")):
+            return value * 60 * 60
+        return value * 24 * 60 * 60
+
+    raw = normalized
     match = _DURATION_RE.match(raw)
     if not match:
         return None
@@ -93,7 +130,7 @@ def _main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Создать блок", callback_data="menu:block"),
+                InlineKeyboardButton(text="Создать тест", callback_data="menu:block"),
                 InlineKeyboardButton(text="Отложить", callback_data="menu:schedule"),
             ],
             [
@@ -127,8 +164,47 @@ def _delay_menu() -> InlineKeyboardMarkup:
     )
 
 
+def _builder_question_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Готово, перейти к отправке", callback_data="builder:finish")],
+            [InlineKeyboardButton(text="Отмена", callback_data="menu:cancel")],
+        ]
+    )
+
+
+def _builder_send_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Отправить сейчас", callback_data="builder:send_now"),
+                InlineKeyboardButton(text="Отложить", callback_data="builder:schedule"),
+            ],
+            [InlineKeyboardButton(text="Отмена", callback_data="menu:cancel")],
+        ]
+    )
+
+
+def _builder_delay_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Через 1 час", callback_data="builder_delay:3600"),
+                InlineKeyboardButton(text="Через 2 часа", callback_data="builder_delay:7200"),
+            ],
+            [
+                InlineKeyboardButton(text="Завтра", callback_data="builder_delay:86400"),
+                InlineKeyboardButton(text="Свое значение", callback_data="builder_delay:custom"),
+            ],
+            [InlineKeyboardButton(text="Отмена", callback_data="menu:cancel")],
+        ]
+    )
+
+
 def _help_text() -> str:
     return (
+        "Кнопка «Создать тест» запускает пошаговое создание: тема, сообщение перед тестом, вопросы по одному, затем отправка сейчас или отложенная отправка.\n"
+        "Вопрос можно прислать текстом или фото с подписью в формате вопроса.\n\n"
         "Формат одного вопроса:\n"
         "1-я строка - вопрос\n"
         "дальше - варианты ответа (2-10)\n"
@@ -211,6 +287,70 @@ async def _post_one_quiz(
     return f"Опубликовал викторину в канал {channel_id}."
 
 
+async def _send_parsed_quiz(
+    *,
+    bot: Bot,
+    channel_id: str,
+    parsed,
+    poll_anonymous: bool,
+    poll_multiple_answers: bool,
+) -> None:
+    if channel_id.startswith("@") or channel_id.startswith("-100"):
+        poll_anonymous = True
+
+    if parsed.has_multiple_correct_options:
+        await bot.send_poll(
+            chat_id=channel_id,
+            question=parsed.question,
+            options=parsed.options,
+            type="regular",
+            is_anonymous=poll_anonymous,
+            allows_multiple_answers=True,
+        )
+        return
+
+    await bot.send_poll(
+        chat_id=channel_id,
+        question=parsed.question,
+        options=parsed.options,
+        type="quiz",
+        correct_option_id=parsed.correct_option_id,
+        is_anonymous=poll_anonymous,
+        allows_multiple_answers=poll_multiple_answers,
+    )
+
+
+async def _post_built_quiz(
+    *,
+    bot: Bot,
+    channel_id: str,
+    intro_text: str | None,
+    questions: list[ScheduledQuizQuestion],
+    poll_anonymous: bool,
+    poll_multiple_answers: bool,
+) -> str:
+    if intro_text:
+        await bot.send_message(chat_id=channel_id, text=intro_text)
+        await asyncio.sleep(0.4)
+
+    for question in questions:
+        parsed = parse_quiz_text(question.text)
+        if question.photo_file_id:
+            await bot.send_photo(chat_id=channel_id, photo=question.photo_file_id)
+            await asyncio.sleep(0.4)
+        await _send_parsed_quiz(
+            bot=bot,
+            channel_id=channel_id,
+            parsed=parsed,
+            poll_anonymous=poll_anonymous,
+            poll_multiple_answers=poll_multiple_answers,
+        )
+        await asyncio.sleep(0.4)
+
+    word = "вопрос" if len(questions) == 1 else "вопроса" if 2 <= len(questions) <= 4 else "вопросов"
+    return f"Опубликовал тест: {len(questions)} {word} в канал {channel_id}."
+
+
 async def _post_quiz_block(
     *,
     bot: Bot,
@@ -271,15 +411,25 @@ async def _run_scheduled_job(
         await asyncio.sleep(delay)
 
     try:
-        await _post_quiz_block(
-            bot=bot,
-            channel_id=job.channel_id,
-            question_text=job.question_text,
-            topic=job.topic,
-            photo_file_id=job.photo_file_id,
-            poll_anonymous=cfg.poll_anonymous,
-            poll_multiple_answers=cfg.poll_multiple_answers,
-        )
+        if job.questions:
+            await _post_built_quiz(
+                bot=bot,
+                channel_id=job.channel_id,
+                intro_text=job.intro_text,
+                questions=job.questions,
+                poll_anonymous=cfg.poll_anonymous,
+                poll_multiple_answers=cfg.poll_multiple_answers,
+            )
+        else:
+            await _post_quiz_block(
+                bot=bot,
+                channel_id=job.channel_id,
+                question_text=job.question_text,
+                topic=job.topic,
+                photo_file_id=job.photo_file_id,
+                poll_anonymous=cfg.poll_anonymous,
+                poll_multiple_answers=cfg.poll_multiple_answers,
+            )
     except Exception:
         logger.exception("Scheduled quiz job %s failed", job.id)
         return
@@ -379,6 +529,126 @@ def build_router(
             reply_markup=_main_menu(),
         )
 
+    def new_builder_state() -> dict[str, object]:
+        return {
+            "mode": "builder_topic",
+            "topic": None,
+            "intro_text": None,
+            "questions": [],
+            "pending_photo_file_id": None,
+        }
+
+    async def start_builder_dialog(message: Message, user_id: int) -> None:
+        pending_actions[user_id] = new_builder_state()
+        await message.answer(
+            "Напишите тему теста.\n\n"
+            "Например: циклы",
+            reply_markup=_cancel_menu(),
+        )
+
+    def builder_intro(topic: str) -> str:
+        return f"Сейчас будет викторина по теме «{topic}»."
+
+    def builder_questions(pending: dict[str, object]) -> list[ScheduledQuizQuestion]:
+        questions = pending.get("questions")
+        if isinstance(questions, list):
+            return questions
+        return []
+
+    async def add_builder_question(
+        *,
+        m: Message,
+        pending: dict[str, object],
+        text: str,
+        photo_file_id: str | None,
+    ) -> None:
+        try:
+            parse_quiz_text(text)
+        except ParseError as e:
+            await m.answer(
+                f"Не смог разобрать вопрос: {e}\n\n"
+                "Формат: первая строка - вопрос, дальше варианты ответов. Правильный вариант отметьте * или +.",
+                reply_markup=_builder_question_menu(),
+            )
+            return
+
+        questions = builder_questions(pending)
+        questions.append(ScheduledQuizQuestion(text=text, photo_file_id=photo_file_id))
+        pending["questions"] = questions
+        pending["pending_photo_file_id"] = None
+
+        await m.answer(
+            f"Добавил вопрос #{len(questions)}.\n\n"
+            "Пришлите следующий вопрос текстом или фото с подписью. Когда вопросы закончатся, нажмите «Готово» или напишите «готово».",
+            reply_markup=_builder_question_menu(),
+        )
+
+    async def show_builder_send_choice(m: Message, pending: dict[str, object]) -> None:
+        questions = builder_questions(pending)
+        if not questions:
+            await m.answer("В тесте пока нет вопросов. Пришлите хотя бы один вопрос.", reply_markup=_builder_question_menu())
+            return
+
+        pending["mode"] = "builder_ready"
+        await m.answer(
+            f"Тест готов: {len(questions)} вопрос(ов).\n\n"
+            "Отправить сейчас или отложить на какое-то время?",
+            reply_markup=_builder_send_menu(),
+        )
+
+    async def publish_builder_now(
+        *,
+        message: Message,
+        channel_id: str,
+        pending: dict[str, object],
+    ) -> None:
+        questions = builder_questions(pending)
+        try:
+            msg = await _post_built_quiz(
+                bot=bot,
+                channel_id=channel_id,
+                intro_text=str(pending.get("intro_text") or ""),
+                questions=questions,
+                poll_anonymous=cfg.poll_anonymous,
+                poll_multiple_answers=cfg.poll_multiple_answers,
+            )
+        except ParseError as e:
+            await message.answer(f"Не смог отправить тест: {e}", reply_markup=_main_menu())
+            return
+        await message.answer(msg, reply_markup=_main_menu())
+
+    async def schedule_builder(
+        *,
+        message: Message,
+        user_id: int,
+        channel_id: str,
+        pending: dict[str, object],
+        delay_seconds: int,
+    ) -> None:
+        questions = builder_questions(pending)
+        if not questions:
+            await message.answer("В тесте пока нет вопросов.", reply_markup=_main_menu())
+            return
+
+        job = schedule_store.add(
+            user_id=user_id,
+            channel_id=channel_id,
+            question_text="",
+            topic=str(pending.get("topic") or "") or None,
+            photo_file_id=None,
+            intro_text=str(pending.get("intro_text") or "") or None,
+            questions=questions,
+            send_at=time.time() + delay_seconds,
+        )
+        _schedule_job_task(bot=bot, job=job, schedule_store=schedule_store, cfg=cfg)
+
+        await message.answer(
+            f"Поставил тест в очередь: {len(questions)} вопрос(ов).\n"
+            f"Отправка: {_format_when(job.send_at)}.\n"
+            f"ID задачи: {job.id[:8]}",
+            reply_markup=_main_menu(),
+        )
+
     @router.message(CommandStart())
     async def start(m: Message) -> None:
         if not _is_allowed(m, cfg.admin_user_id):
@@ -422,6 +692,15 @@ def build_router(
 
         await m.answer(_scheduled_text(schedule_store), reply_markup=_main_menu())
 
+    @router.message(Command("test"))
+    async def test_cmd(m: Message) -> None:
+        if not _is_allowed(m, cfg.admin_user_id):
+            return
+        if not m.from_user:
+            return
+
+        await start_builder_dialog(m, m.from_user.id)
+
     @router.callback_query(F.data == "menu:block")
     async def menu_block(c: CallbackQuery) -> None:
         if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
@@ -431,14 +710,7 @@ def build_router(
             await c.answer()
             return
 
-        pending_actions[c.from_user.id] = {"mode": "block"}
-        await c.message.answer(
-            "Пришлите блок вопросов одним сообщением.\n\n"
-            "Тему можно написать первой строкой, например:\n"
-            "Тема: История\n\n"
-            "Вопросы разделяйте пустой строкой или строкой ---.",
-            reply_markup=_cancel_menu(),
-        )
+        await start_builder_dialog(c.message, c.from_user.id)
         await c.answer()
 
     @router.callback_query(F.data == "menu:schedule")
@@ -522,6 +794,110 @@ def build_router(
         await c.message.answer("Ок, отменил текущее действие.", reply_markup=_main_menu())
         await c.answer()
 
+    @router.callback_query(F.data == "builder:finish")
+    async def builder_finish(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        pending = pending_actions.get(c.from_user.id)
+        if not pending or pending.get("mode") not in {"builder_questions", "builder_ready"}:
+            await c.message.answer("Сейчас нет теста в сборке.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        await show_builder_send_choice(c.message, pending)
+        await c.answer()
+
+    @router.callback_query(F.data == "builder:send_now")
+    async def builder_send_now(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        pending = pending_actions.pop(c.from_user.id, None)
+        if not pending or pending.get("mode") != "builder_ready":
+            await c.message.answer("Сейчас нет готового теста.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        channel_id = channel_store.get(c.from_user.id) or cfg.target_channel_id
+        if not channel_id:
+            pending_actions[c.from_user.id] = pending
+            users_waiting_for_channel.add(c.from_user.id)
+            await _ask_channel_id(c.message)
+            await c.answer()
+            return
+
+        await publish_builder_now(message=c.message, channel_id=channel_id, pending=pending)
+        await c.answer()
+
+    @router.callback_query(F.data == "builder:schedule")
+    async def builder_schedule_choice(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        pending = pending_actions.get(c.from_user.id)
+        if not pending or pending.get("mode") != "builder_ready":
+            await c.message.answer("Сейчас нет готового теста.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        pending["mode"] = "builder_delay"
+        await c.message.answer(
+            "Через сколько отправить тест?\n\n"
+            "Можно выбрать кнопку или потом написать свое значение: 30m, 1h, 2h, 1d.",
+            reply_markup=_builder_delay_menu(),
+        )
+        await c.answer()
+
+    @router.callback_query(F.data.startswith("builder_delay:"))
+    async def builder_schedule_delay(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        pending = pending_actions.get(c.from_user.id)
+        if not pending or pending.get("mode") not in {"builder_ready", "builder_delay"}:
+            await c.message.answer("Сейчас нет готового теста.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        raw_delay = (c.data or "").split(":", 1)[1]
+        if raw_delay == "custom":
+            await c.message.answer(
+                "Напишите задержку: например 30m, 1h, 2h или 1d. Если написать просто число, это будут минуты.",
+                reply_markup=_cancel_menu(),
+            )
+            await c.answer()
+            return
+
+        try:
+            delay_seconds = int(raw_delay)
+        except ValueError:
+            await c.message.answer("Не понял задержку. Попробуйте еще раз.", reply_markup=_builder_delay_menu())
+            await c.answer()
+            return
+
+        pending_actions.pop(c.from_user.id, None)
+        channel_id = channel_store.get(c.from_user.id) or cfg.target_channel_id
+        if not channel_id:
+            pending_actions[c.from_user.id] = pending
+            users_waiting_for_channel.add(c.from_user.id)
+            await _ask_channel_id(c.message)
+            await c.answer()
+            return
+
+        await schedule_builder(
+            message=c.message,
+            user_id=c.from_user.id,
+            channel_id=channel_id,
+            pending=pending,
+            delay_seconds=delay_seconds,
+        )
+        await c.answer()
+
     @router.message(Command("block"))
     async def block_cmd(m: Message, bot: Bot) -> None:
         if not _is_allowed(m, cfg.admin_user_id):
@@ -593,6 +969,26 @@ def build_router(
         if not m.from_user:
             return
 
+        pending = pending_actions.get(m.from_user.id)
+        if pending and pending.get("mode") == "builder_questions":
+            photo = m.photo[-1]
+            caption = (m.caption or "").strip()
+            if caption:
+                await add_builder_question(
+                    m=m,
+                    pending=pending,
+                    text=caption,
+                    photo_file_id=photo.file_id,
+                )
+                return
+
+            pending["pending_photo_file_id"] = photo.file_id
+            await m.answer(
+                "Фото принял. Теперь пришлите текст этого вопроса: вопрос первой строкой, ниже варианты ответов.",
+                reply_markup=_builder_question_menu(),
+            )
+            return
+
         channel_id = await ensure_channel(m)
         if not channel_id:
             return
@@ -645,12 +1041,127 @@ def build_router(
 
             channel_store.set(m.from_user.id, channel_id)
             users_waiting_for_channel.discard(m.from_user.id)
+            pending = pending_actions.get(m.from_user.id)
+            if pending and pending.get("mode") in {"builder_ready", "builder_delay"}:
+                pending["mode"] = "builder_ready"
+                await m.answer(
+                    f"Канал сохранен: {channel_id}\n\n"
+                    "Можно отправить готовый тест сейчас или отложить.",
+                    reply_markup=_builder_send_menu(),
+                )
+                return
+
             await m.answer(
                 f"Канал сохранен: {channel_id}\n"
                 "Теперь он используется по умолчанию. Чтобы заменить канал, отправьте /channel.",
                 reply_markup=_main_menu(),
             )
             return
+
+        if text.lower() in {"создать тест", "создать викторину", "новый тест"}:
+            await start_builder_dialog(m, m.from_user.id)
+            return
+
+        pending = pending_actions.get(m.from_user.id)
+        if pending:
+            mode = pending.get("mode")
+
+            if mode == "builder_topic":
+                topic = text.strip()
+                if not topic:
+                    await m.answer("Напишите тему теста, например: циклы.", reply_markup=_cancel_menu())
+                    return
+                pending["topic"] = topic
+                pending["intro_text"] = builder_intro(topic)
+                pending["mode"] = "builder_intro"
+                await m.answer(
+                    f"Сообщение перед тестом:\n\n{pending['intro_text']}\n\n"
+                    "Пришлите другой текст, если хотите заменить его, или напишите - чтобы оставить так.",
+                    reply_markup=_cancel_menu(),
+                )
+                return
+
+            if mode == "builder_intro":
+                if text not in {"-", "—"}:
+                    pending["intro_text"] = text
+                pending["mode"] = "builder_questions"
+                await m.answer(
+                    "Теперь присылайте вопросы по одному.\n\n"
+                    "Можно текстом:\n"
+                    "Что выведет цикл?\n"
+                    "*0 1 2\n"
+                    "1 2 3\n\n"
+                    "Или фото с такой подписью. Когда закончите, нажмите «Готово» или напишите «готово».",
+                    reply_markup=_builder_question_menu(),
+                )
+                return
+
+            if mode == "builder_questions":
+                if text.lower() in {"готово", "done", "finish", "стоп"}:
+                    if pending.get("pending_photo_file_id"):
+                        await m.answer(
+                            "К последнему фото еще нужен текст вопроса. Пришлите вопрос или отмените создание теста.",
+                            reply_markup=_builder_question_menu(),
+                        )
+                        return
+                    await show_builder_send_choice(m, pending)
+                    return
+
+                photo_file_id = pending.get("pending_photo_file_id")
+                await add_builder_question(
+                    m=m,
+                    pending=pending,
+                    text=text,
+                    photo_file_id=str(photo_file_id) if photo_file_id else None,
+                )
+                return
+
+            if mode == "builder_ready":
+                delay_seconds = _parse_delay(text)
+                channel_id = await ensure_channel(m)
+                if not channel_id:
+                    return
+
+                pending_actions.pop(m.from_user.id, None)
+                if text.lower() in {"сейчас", "отправить", "отправить сейчас", "send"}:
+                    await publish_builder_now(message=m, channel_id=channel_id, pending=pending)
+                    return
+                if delay_seconds is not None:
+                    await schedule_builder(
+                        message=m,
+                        user_id=m.from_user.id,
+                        channel_id=channel_id,
+                        pending=pending,
+                        delay_seconds=delay_seconds,
+                    )
+                    return
+
+                pending_actions[m.from_user.id] = pending
+                await show_builder_send_choice(m, pending)
+                return
+
+            if mode == "builder_delay":
+                delay_seconds = _parse_delay(text)
+                if delay_seconds is None:
+                    await m.answer(
+                        "Не понял время. Используйте формат 30m, 1h, 2h или 1d.",
+                        reply_markup=_cancel_menu(),
+                    )
+                    return
+
+                channel_id = await ensure_channel(m)
+                if not channel_id:
+                    return
+
+                pending_actions.pop(m.from_user.id, None)
+                await schedule_builder(
+                    message=m,
+                    user_id=m.from_user.id,
+                    channel_id=channel_id,
+                    pending=pending,
+                    delay_seconds=delay_seconds,
+                )
+                return
 
         channel_id = await ensure_channel(m)
         if not channel_id:
@@ -719,6 +1230,7 @@ async def main() -> None:
         [
             BotCommand(command="start", description="Открыть меню"),
             BotCommand(command="help", description="Показать формат вопросов"),
+            BotCommand(command="test", description="Создать тест пошагово"),
             BotCommand(command="block", description="Опубликовать блок вопросов"),
             BotCommand(command="schedule", description="Отложить блок вопросов"),
             BotCommand(command="scheduled", description="Показать очередь"),
