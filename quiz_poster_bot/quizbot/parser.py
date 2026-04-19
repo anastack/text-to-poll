@@ -69,7 +69,7 @@ def parse_quiz_text(text: str) -> ParsedQuiz:
         raise ParseError("Telegram поддерживает максимум 10 вариантов. Укоротите список.")
 
     if not correct_indices:
-        correct_indices = [0]
+        raise ParseError("Отправьте вопрос еще раз и пометьте правильный ответ символом * или +.")
 
     return ParsedQuiz(question=question, options=options, correct_option_ids=correct_indices)
 

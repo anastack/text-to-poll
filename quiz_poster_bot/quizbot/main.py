@@ -15,7 +15,6 @@ from .config import load_config
 from .parser import ParseError, parse_quiz_block_text, parse_quiz_text
 from .state import (
     ChannelSelectionStore,
-    PhotoCache,
     ScheduledQuizJob,
     ScheduledQuizQuestion,
     ScheduledQuizStore,
@@ -104,35 +103,10 @@ def _format_when(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%d.%m.%Y %H:%M:%S")
 
 
-def _split_command_payload(text: str) -> tuple[str, str]:
-    lines = text.replace("\r\n", "\n").split("\n", 1)
-    header = lines[0].strip()
-    body = lines[1].strip() if len(lines) > 1 else ""
-    return header, body
-
-
-def _command_tail(header: str) -> str:
-    parts = header.split(maxsplit=1)
-    return parts[1].strip() if len(parts) > 1 else ""
-
-
-def _looks_like_block(text: str) -> bool:
-    normalized = text.replace("\r\n", "\n")
-    return bool(
-        re.search(r"(?mi)^\s*(?:тема|topic)\s*:", normalized)
-        or re.search(r"(?m)^\s*#", normalized)
-        or re.search(r"(?m)^\s*---+\s*$", normalized)
-        or re.search(r"\n\s*\n", normalized)
-    )
-
-
 def _main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Создать тест", callback_data="menu:block"),
-                InlineKeyboardButton(text="Отложить", callback_data="menu:schedule"),
-            ],
+            [InlineKeyboardButton(text="Создать тест", callback_data="menu:test")],
             [
                 InlineKeyboardButton(text="Очередь", callback_data="menu:scheduled"),
                 InlineKeyboardButton(text="Канал", callback_data="menu:channel"),
@@ -145,22 +119,6 @@ def _main_menu() -> InlineKeyboardMarkup:
 def _cancel_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu:cancel")]]
-    )
-
-
-def _delay_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Через 10 минут", callback_data="schedule:600"),
-                InlineKeyboardButton(text="Через 1 час", callback_data="schedule:3600"),
-            ],
-            [
-                InlineKeyboardButton(text="Через 3 часа", callback_data="schedule:10800"),
-                InlineKeyboardButton(text="Завтра", callback_data="schedule:86400"),
-            ],
-            [InlineKeyboardButton(text="Отмена", callback_data="menu:cancel")],
-        ]
     )
 
 
@@ -207,29 +165,23 @@ def _help_text() -> str:
         "Вопрос можно прислать текстом или фото с подписью в формате вопроса.\n\n"
         "Формат одного вопроса:\n"
         "1-я строка - вопрос\n"
+        "между вопросом и ответами можно оставлять пустые строки и пробелы\n"
         "дальше - варианты ответа (2-10)\n"
-        "правильный вариант: * или + в начале строки\n\n"
-        "Блок вопросов:\n"
-        "/block Тема\n"
-        "Вопрос 1?\n"
-        "*Ответ\n"
-        "Другой ответ\n\n"
-        "Вопрос 2?\n"
-        "*Ответ\n"
-        "Другой ответ\n\n"
-        "Отложенная отправка:\n"
-        "/schedule 10m Тема\n"
-        "и дальше такой же блок вопросов.\n\n"
-        "Вопросы можно разделять пустой строкой или строкой ---."
+        "правильный вариант обязательно отметьте * или + в начале строки\n\n"
+        "Пример:\n"
+        "Что выведет цикл?\n\n"
+        "*0 1 2\n"
+        "1 2 3\n"
+        "ошибка"
     )
 
 
 def _scheduled_text(schedule_store: ScheduledQuizStore) -> str:
     jobs = schedule_store.list_all()
     if not jobs:
-        return "Отложенных блоков пока нет."
+        return "Отложенных тестов пока нет."
 
-    lines = ["Отложенные блоки:"]
+    lines = ["Отложенные тесты:"]
     for job in jobs:
         topic = f" - {job.topic}" if job.topic else ""
         lines.append(f"{job.id[:8]}: {_format_when(job.send_at)}{topic} -> {job.channel_id}")
@@ -244,47 +196,6 @@ async def _ask_channel_id(m: Message) -> None:
         "@your_public_channel\n\n"
         "Бот должен быть админом этого канала."
     )
-
-
-async def _post_one_quiz(
-    *,
-    bot: Bot,
-    channel_id: str,
-    question_text: str,
-    photo_file_id: str | None,
-    poll_anonymous: bool,
-    poll_multiple_answers: bool,
-) -> str:
-    parsed = parse_quiz_text(question_text)
-
-    if photo_file_id:
-        await bot.send_photo(chat_id=channel_id, photo=photo_file_id)
-
-    # Telegram limitation: non-anonymous polls can't be sent to channels.
-    if channel_id.startswith("@") or channel_id.startswith("-100"):
-        poll_anonymous = True
-
-    if parsed.has_multiple_correct_options:
-        await bot.send_poll(
-            chat_id=channel_id,
-            question=parsed.question,
-            options=parsed.options,
-            type="regular",
-            is_anonymous=poll_anonymous,
-            allows_multiple_answers=True,
-        )
-        return f"Опубликовал опрос с несколькими вариантами ответа в канал {channel_id}."
-
-    await bot.send_poll(
-        chat_id=channel_id,
-        question=parsed.question,
-        options=parsed.options,
-        type="quiz",
-        correct_option_id=parsed.correct_option_id,
-        is_anonymous=poll_anonymous,
-        allows_multiple_answers=poll_multiple_answers,
-    )
-    return f"Опубликовал викторину в канал {channel_id}."
 
 
 async def _send_parsed_quiz(
@@ -452,7 +363,6 @@ def _schedule_job_task(
 def build_router(
     *,
     bot: Bot,
-    photo_cache: PhotoCache,
     channel_store: ChannelSelectionStore,
     schedule_store: ScheduledQuizStore,
     cfg,
@@ -472,62 +382,6 @@ def build_router(
         users_waiting_for_channel.add(m.from_user.id)
         await _ask_channel_id(m)
         return None
-
-    async def publish_block_from_text(
-        *,
-        m: Message,
-        channel_id: str,
-        text: str,
-        topic: str | None,
-    ) -> None:
-        photo_file_id = photo_cache.pop_if_fresh(m.from_user.id)
-        try:
-            msg = await _post_quiz_block(
-                bot=bot,
-                channel_id=channel_id,
-                question_text=text,
-                topic=topic,
-                photo_file_id=photo_file_id,
-                poll_anonymous=cfg.poll_anonymous,
-                poll_multiple_answers=cfg.poll_multiple_answers,
-            )
-        except ParseError as e:
-            await m.answer(f"Не смог разобрать блок: {e}", reply_markup=_main_menu())
-            return
-        await m.answer(msg, reply_markup=_main_menu())
-
-    async def schedule_block_from_text(
-        *,
-        m: Message,
-        channel_id: str,
-        text: str,
-        delay_seconds: int,
-        topic: str | None,
-    ) -> None:
-        photo_file_id = photo_cache.pop_if_fresh(m.from_user.id)
-        try:
-            block = parse_quiz_block_text(text, topic=topic)
-        except ParseError as e:
-            await m.answer(f"Не смог разобрать блок: {e}", reply_markup=_main_menu())
-            return
-
-        job = schedule_store.add(
-            user_id=m.from_user.id,
-            channel_id=channel_id,
-            question_text=text,
-            topic=block.topic,
-            photo_file_id=photo_file_id,
-            send_at=time.time() + delay_seconds,
-        )
-        _schedule_job_task(bot=bot, job=job, schedule_store=schedule_store, cfg=cfg)
-
-        await m.answer(
-            f"Поставил в очередь {len(block.quizzes)} вопросов"
-            f"{f' по теме «{block.topic}»' if block.topic else ''}.\n"
-            f"Отправка: {_format_when(job.send_at)}.\n"
-            f"ID задачи: {job.id[:8]}",
-            reply_markup=_main_menu(),
-        )
 
     def new_builder_state() -> dict[str, object]:
         return {
@@ -565,8 +419,19 @@ def build_router(
         try:
             parse_quiz_text(text)
         except ParseError as e:
+            if photo_file_id:
+                pending["pending_photo_file_id"] = photo_file_id
+
+            error_text = str(e)
+            if "пометьте правильный ответ" in error_text:
+                await m.answer(
+                    error_text,
+                    reply_markup=_builder_question_menu(),
+                )
+                return
+
             await m.answer(
-                f"Не смог разобрать вопрос: {e}\n\n"
+                f"Не смог разобрать вопрос: {error_text}\n\n"
                 "Формат: первая строка - вопрос, дальше варианты ответов. Правильный вариант отметьте * или +.",
                 reply_markup=_builder_question_menu(),
             )
@@ -665,8 +530,7 @@ def build_router(
 
         await m.answer(
             f"Текущий канал: {channel_id}\n\n"
-            "Один вопрос можно отправить обычным сообщением: вопрос и варианты с новой строки, правильный вариант пометьте * или +.\n\n"
-            "Для блоков, отложенной отправки и очереди используйте кнопки ниже.",
+            "Создавайте тест пошагово: тема, сообщение перед тестом, вопросы по одному, затем отправка сейчас или отложенная отправка.",
             reply_markup=_main_menu(),
         )
 
@@ -701,8 +565,8 @@ def build_router(
 
         await start_builder_dialog(m, m.from_user.id)
 
-    @router.callback_query(F.data == "menu:block")
-    async def menu_block(c: CallbackQuery) -> None:
+    @router.callback_query(F.data == "menu:test")
+    async def menu_test(c: CallbackQuery) -> None:
         if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
             await c.answer()
             return
@@ -711,41 +575,6 @@ def build_router(
             return
 
         await start_builder_dialog(c.message, c.from_user.id)
-        await c.answer()
-
-    @router.callback_query(F.data == "menu:schedule")
-    async def menu_schedule(c: CallbackQuery) -> None:
-        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
-            await c.answer()
-            return
-
-        await c.message.answer("Через сколько отправить блок?", reply_markup=_delay_menu())
-        await c.answer()
-
-    @router.callback_query(F.data.startswith("schedule:"))
-    async def menu_schedule_delay(c: CallbackQuery) -> None:
-        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
-            await c.answer()
-            return
-        if not c.from_user:
-            await c.answer()
-            return
-
-        raw_delay = (c.data or "").split(":", 1)[1]
-        try:
-            delay_seconds = int(raw_delay)
-        except ValueError:
-            await c.message.answer("Не понял задержку. Попробуйте еще раз.", reply_markup=_main_menu())
-            await c.answer()
-            return
-
-        pending_actions[c.from_user.id] = {"mode": "schedule", "delay_seconds": delay_seconds}
-        await c.message.answer(
-            "Теперь пришлите блок вопросов одним сообщением.\n\n"
-            "Тему можно написать первой строкой, например:\n"
-            "Тема: История",
-            reply_markup=_cancel_menu(),
-        )
         await c.answer()
 
     @router.callback_query(F.data == "menu:scheduled")
@@ -898,69 +727,6 @@ def build_router(
         )
         await c.answer()
 
-    @router.message(Command("block"))
-    async def block_cmd(m: Message, bot: Bot) -> None:
-        if not _is_allowed(m, cfg.admin_user_id):
-            return
-        if not m.from_user:
-            return
-
-        pending_actions.pop(m.from_user.id, None)
-        channel_id = await ensure_channel(m)
-        if not channel_id:
-            return
-
-        header, body = _split_command_payload(m.text or "")
-        topic = _command_tail(header) or None
-        if not body:
-            await m.answer(
-                "После /block добавьте блок вопросов. Например: /block История, а ниже вопросы.",
-                reply_markup=_main_menu(),
-            )
-            return
-
-        await publish_block_from_text(m=m, channel_id=channel_id, text=body, topic=topic)
-
-    @router.message(Command("schedule"))
-    async def schedule_cmd(m: Message) -> None:
-        if not _is_allowed(m, cfg.admin_user_id):
-            return
-        if not m.from_user:
-            return
-
-        pending_actions.pop(m.from_user.id, None)
-        channel_id = await ensure_channel(m)
-        if not channel_id:
-            return
-
-        header, body = _split_command_payload(m.text or "")
-        args = _command_tail(header)
-        if not args or not body:
-            await m.answer(
-                "Формат: /schedule 10m Тема\n"
-                "Ниже добавьте блок вопросов. Время можно указать как 30s, 10m, 2h или 1d.",
-                reply_markup=_main_menu(),
-            )
-            return
-
-        parts = args.split(maxsplit=1)
-        delay_seconds = _parse_delay(parts[0])
-        if delay_seconds is None:
-            await m.answer(
-                "Не понял время. Используйте формат 30s, 10m, 2h или 1d.",
-                reply_markup=_main_menu(),
-            )
-            return
-
-        topic = parts[1].strip() if len(parts) > 1 else None
-        await schedule_block_from_text(
-            m=m,
-            channel_id=channel_id,
-            text=body,
-            delay_seconds=delay_seconds,
-            topic=topic,
-        )
-
     @router.message(F.photo)
     async def on_photo(m: Message, bot: Bot) -> None:
         if not _is_allowed(m, cfg.admin_user_id):
@@ -989,33 +755,9 @@ def build_router(
             )
             return
 
-        channel_id = await ensure_channel(m)
-        if not channel_id:
-            return
-
-        photo = m.photo[-1]
-        caption = (m.caption or "").strip()
-
-        if caption:
-            try:
-                msg = await _post_quiz_block(
-                    bot=bot,
-                    channel_id=channel_id,
-                    question_text=caption,
-                    topic=None,
-                    photo_file_id=photo.file_id,
-                    poll_anonymous=cfg.poll_anonymous,
-                    poll_multiple_answers=cfg.poll_multiple_answers,
-                )
-            except ParseError as e:
-                await m.answer(f"Не смог разобрать подпись: {e}")
-                return
-            await m.answer(msg)
-            return
-
-        photo_cache.set(m.from_user.id, photo.file_id)
         await m.answer(
-            "Ок. Теперь пришлите текст вопроса или блок вопросов, прикреплю это фото к публикации."
+            "Фото добавляется только внутри создания теста. Нажмите «Создать тест» или отправьте /test, затем добавьте вопрос с картинкой.",
+            reply_markup=_main_menu(),
         )
 
     @router.message(F.text)
@@ -1163,55 +905,10 @@ def build_router(
                 )
                 return
 
-        channel_id = await ensure_channel(m)
-        if not channel_id:
-            return
-
-        pending = pending_actions.pop(m.from_user.id, None)
-        if pending:
-            mode = pending.get("mode")
-            if mode == "block":
-                await publish_block_from_text(m=m, channel_id=channel_id, text=text, topic=None)
-                return
-            if mode == "schedule":
-                delay_seconds = int(pending.get("delay_seconds", 0))
-                if delay_seconds <= 0:
-                    await m.answer("Не понял задержку. Попробуйте еще раз.", reply_markup=_main_menu())
-                    return
-                await schedule_block_from_text(
-                    m=m,
-                    channel_id=channel_id,
-                    text=text,
-                    delay_seconds=delay_seconds,
-                    topic=None,
-                )
-                return
-
-        photo_file_id = photo_cache.pop_if_fresh(m.from_user.id)
-        try:
-            if _looks_like_block(text):
-                msg = await _post_quiz_block(
-                    bot=bot,
-                    channel_id=channel_id,
-                    question_text=text,
-                    topic=None,
-                    photo_file_id=photo_file_id,
-                    poll_anonymous=cfg.poll_anonymous,
-                    poll_multiple_answers=cfg.poll_multiple_answers,
-                )
-            else:
-                msg = await _post_one_quiz(
-                    bot=bot,
-                    channel_id=channel_id,
-                    question_text=text,
-                    photo_file_id=photo_file_id,
-                    poll_anonymous=cfg.poll_anonymous,
-                    poll_multiple_answers=cfg.poll_multiple_answers,
-                )
-        except ParseError as e:
-            await m.answer(f"Не смог разобрать текст: {e}")
-            return
-        await m.answer(msg)
+        await m.answer(
+            "Чтобы создать тест, нажмите «Создать тест» или отправьте /test. Вопросы теперь добавляются только по одному в этом режиме.",
+            reply_markup=_main_menu(),
+        )
 
     return router
 
@@ -1231,15 +928,12 @@ async def main() -> None:
             BotCommand(command="start", description="Открыть меню"),
             BotCommand(command="help", description="Показать формат вопросов"),
             BotCommand(command="test", description="Создать тест пошагово"),
-            BotCommand(command="block", description="Опубликовать блок вопросов"),
-            BotCommand(command="schedule", description="Отложить блок вопросов"),
             BotCommand(command="scheduled", description="Показать очередь"),
             BotCommand(command="channel", description="Сменить канал"),
         ]
     )
 
     base_path = Path(__file__).resolve().parent.parent
-    photo_cache = PhotoCache(ttl_seconds=cfg.photo_ttl_seconds)
     channel_store = ChannelSelectionStore(base_path / "channel_selections.json")
     schedule_store = ScheduledQuizStore(base_path / "scheduled_quizzes.json")
 
@@ -1249,7 +943,6 @@ async def main() -> None:
     dp.include_router(
         build_router(
             bot=bot,
-            photo_cache=photo_cache,
             channel_store=channel_store,
             schedule_store=schedule_store,
             cfg=cfg,
