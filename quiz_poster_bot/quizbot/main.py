@@ -8,6 +8,7 @@ import re
 import time
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -22,6 +23,8 @@ from .state import (
 
 
 logger = logging.getLogger(__name__)
+_POST_PAUSE_SECONDS = 3.2
+_MAX_TELEGRAM_SEND_ATTEMPTS = 5
 _DURATION_RE = re.compile(r"^\s*(\d+)\s*([smhdсмчд]?)\s*$", re.IGNORECASE)
 
 
@@ -210,7 +213,8 @@ async def _send_parsed_quiz(
         poll_anonymous = True
 
     if parsed.has_multiple_correct_options:
-        await bot.send_poll(
+        await _send_telegram(
+            bot.send_poll,
             chat_id=channel_id,
             question=parsed.question,
             options=parsed.options,
@@ -220,7 +224,8 @@ async def _send_parsed_quiz(
         )
         return
 
-    await bot.send_poll(
+    await _send_telegram(
+        bot.send_poll,
         chat_id=channel_id,
         question=parsed.question,
         options=parsed.options,
@@ -231,6 +236,35 @@ async def _send_parsed_quiz(
     )
 
 
+async def _send_telegram(method, *args, **kwargs):
+    for attempt in range(1, _MAX_TELEGRAM_SEND_ATTEMPTS + 1):
+        try:
+            return await method(*args, **kwargs)
+        except TelegramRetryAfter as e:
+            delay = max(float(e.retry_after), 1.0) + 0.5
+            logger.warning(
+                "Telegram flood limit while calling %s; retrying in %.1f seconds",
+                getattr(method, "__name__", method.__class__.__name__),
+                delay,
+            )
+            await asyncio.sleep(delay)
+        except (TelegramNetworkError, TelegramServerError):
+            if attempt >= _MAX_TELEGRAM_SEND_ATTEMPTS:
+                raise
+            delay = float(attempt * 2)
+            logger.warning(
+                "Temporary Telegram error while calling %s; attempt %s/%s, retrying in %.1f seconds",
+                getattr(method, "__name__", method.__class__.__name__),
+                attempt,
+                _MAX_TELEGRAM_SEND_ATTEMPTS,
+                delay,
+                exc_info=True,
+            )
+            await asyncio.sleep(delay)
+
+    return await method(*args, **kwargs)
+
+
 async def _post_built_quiz(
     *,
     bot: Bot,
@@ -239,16 +273,20 @@ async def _post_built_quiz(
     questions: list[ScheduledQuizQuestion],
     poll_anonymous: bool,
     poll_multiple_answers: bool,
+    start_index: int = 0,
+    on_question_posted=None,
 ) -> str:
-    if intro_text:
-        await bot.send_message(chat_id=channel_id, text=intro_text)
-        await asyncio.sleep(0.4)
+    start_index = max(0, min(start_index, len(questions)))
 
-    for question in questions:
+    if intro_text and start_index == 0:
+        await _send_telegram(bot.send_message, chat_id=channel_id, text=intro_text)
+        await asyncio.sleep(_POST_PAUSE_SECONDS)
+
+    for question_number, question in enumerate(questions[start_index:], start=start_index + 1):
         parsed = parse_quiz_text(question.text)
         if question.photo_file_id:
-            await bot.send_photo(chat_id=channel_id, photo=question.photo_file_id)
-            await asyncio.sleep(0.4)
+            await _send_telegram(bot.send_photo, chat_id=channel_id, photo=question.photo_file_id)
+            await asyncio.sleep(_POST_PAUSE_SECONDS)
         await _send_parsed_quiz(
             bot=bot,
             channel_id=channel_id,
@@ -256,7 +294,9 @@ async def _post_built_quiz(
             poll_anonymous=poll_anonymous,
             poll_multiple_answers=poll_multiple_answers,
         )
-        await asyncio.sleep(0.4)
+        if on_question_posted:
+            on_question_posted(question_number)
+        await asyncio.sleep(_POST_PAUSE_SECONDS)
 
     word = "вопрос" if len(questions) == 1 else "вопроса" if 2 <= len(questions) <= 4 else "вопросов"
     return f"Опубликовал тест: {len(questions)} {word} в канал {channel_id}."
@@ -275,17 +315,20 @@ async def _post_quiz_block(
     block = parse_quiz_block_text(question_text, topic=topic)
 
     if photo_file_id:
-        await bot.send_photo(chat_id=channel_id, photo=photo_file_id)
+        await _send_telegram(bot.send_photo, chat_id=channel_id, photo=photo_file_id)
+        await asyncio.sleep(_POST_PAUSE_SECONDS)
 
     if block.topic:
-        await bot.send_message(chat_id=channel_id, text=f"Тема: {block.topic}")
+        await _send_telegram(bot.send_message, chat_id=channel_id, text=f"Тема: {block.topic}")
+        await asyncio.sleep(_POST_PAUSE_SECONDS)
 
     for parsed in block.quizzes:
         if channel_id.startswith("@") or channel_id.startswith("-100"):
             poll_anonymous = True
 
         if parsed.has_multiple_correct_options:
-            await bot.send_poll(
+            await _send_telegram(
+                bot.send_poll,
                 chat_id=channel_id,
                 question=parsed.question,
                 options=parsed.options,
@@ -294,7 +337,8 @@ async def _post_quiz_block(
                 allows_multiple_answers=True,
             )
         else:
-            await bot.send_poll(
+            await _send_telegram(
+                bot.send_poll,
                 chat_id=channel_id,
                 question=parsed.question,
                 options=parsed.options,
@@ -303,7 +347,7 @@ async def _post_quiz_block(
                 is_anonymous=poll_anonymous,
                 allows_multiple_answers=poll_multiple_answers,
             )
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(_POST_PAUSE_SECONDS)
 
     word = "вопрос" if len(block.quizzes) == 1 else "вопроса" if 2 <= len(block.quizzes) <= 4 else "вопросов"
     topic_suffix = f" по теме «{block.topic}»" if block.topic else ""
@@ -330,6 +374,8 @@ async def _run_scheduled_job(
                 questions=job.questions,
                 poll_anonymous=cfg.poll_anonymous,
                 poll_multiple_answers=cfg.poll_multiple_answers,
+                start_index=job.published_question_count,
+                on_question_posted=lambda count: schedule_store.mark_progress(job.id, count),
             )
         else:
             await _post_quiz_block(
