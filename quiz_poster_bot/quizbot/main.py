@@ -178,6 +178,17 @@ def _builder_delay_menu() -> InlineKeyboardMarkup:
     )
 
 
+def _single_question_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Отправить вопрос", callback_data="single:send"),
+                InlineKeyboardButton(text="Отмена", callback_data="menu:cancel"),
+            ],
+        ]
+    )
+
+
 def _help_text() -> str:
     return (
         "Кнопка «Создать тест» запускает пошаговое создание: тема, сообщение перед тестом, вопросы по одному, затем отправка сейчас или отложенная отправка.\n"
@@ -523,6 +534,37 @@ def build_router(
             reply_markup=_builder_send_menu(),
         )
 
+    async def show_single_question_choice(message: Message, question_text: str, channel_id: str) -> None:
+        parsed = parse_quiz_text(question_text)
+        channel_name = await _channel_display_name(bot, channel_id)
+        await message.answer(
+            f"Похоже, это одиночный вопрос:\n\n{parsed.question}\n\n"
+            f"Отправить его в канал {channel_name}?",
+            reply_markup=_single_question_menu(),
+        )
+
+    async def publish_single_question(
+        *,
+        message: Message,
+        channel_id: str,
+        question_text: str,
+    ) -> None:
+        try:
+            parsed = parse_quiz_text(question_text)
+            await _send_parsed_quiz(
+                bot=bot,
+                channel_id=channel_id,
+                parsed=parsed,
+                poll_anonymous=cfg.poll_anonymous,
+                poll_multiple_answers=cfg.poll_multiple_answers,
+            )
+        except ParseError as e:
+            await message.answer(f"Не смог отправить вопрос: {e}", reply_markup=_main_menu())
+            return
+
+        channel_name = await _channel_display_name(bot, channel_id)
+        await message.answer(f"Отправил одиночный вопрос в канал {channel_name}.", reply_markup=_main_menu())
+
     async def publish_builder_now(
         *,
         message: Message,
@@ -724,6 +766,33 @@ def build_router(
         await publish_builder_now(message=c.message, channel_id=channel_id, pending=pending)
         await c.answer()
 
+    @router.callback_query(F.data == "single:send")
+    async def single_send(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        pending = pending_actions.get(c.from_user.id)
+        if not pending or pending.get("mode") != "single_question_confirm":
+            await c.message.answer("Сейчас нет одиночного вопроса для отправки.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        channel_id = channel_store.get(c.from_user.id) or cfg.target_channel_id
+        if not channel_id:
+            users_waiting_for_channel.add(c.from_user.id)
+            await _ask_channel_id(c.message)
+            await c.answer()
+            return
+
+        pending_actions.pop(c.from_user.id, None)
+        await publish_single_question(
+            message=c.message,
+            channel_id=channel_id,
+            question_text=str(pending.get("question_text") or ""),
+        )
+        await c.answer()
+
     @router.callback_query(F.data == "builder:schedule")
     async def builder_schedule_choice(c: CallbackQuery) -> None:
         if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
@@ -848,6 +917,12 @@ def build_router(
             users_waiting_for_channel.discard(m.from_user.id)
             channel_name = await _channel_display_name(bot, channel_id)
             pending = pending_actions.get(m.from_user.id)
+            if pending and pending.get("mode") == "single_question_confirm":
+                question_text = str(pending.get("question_text") or "")
+                await m.answer(f"Канал сохранен: {channel_name}")
+                await show_single_question_choice(m, question_text, channel_id)
+                return
+
             if pending and pending.get("mode") in {"builder_ready", "builder_delay"}:
                 pending["mode"] = "builder_ready"
                 await m.answer(
@@ -968,6 +1043,52 @@ def build_router(
                     delay_seconds=delay_seconds,
                 )
                 return
+
+            if mode == "single_question_confirm":
+                normalized = text.lower()
+                if normalized in {"да", "ок", "окей", "отправить", "send", "yes"}:
+                    channel_id = await ensure_channel(m)
+                    if not channel_id:
+                        return
+
+                    pending_actions.pop(m.from_user.id, None)
+                    await publish_single_question(
+                        message=m,
+                        channel_id=channel_id,
+                        question_text=str(pending.get("question_text") or ""),
+                    )
+                    return
+
+                if normalized in {"нет", "отмена", "cancel", "no"}:
+                    pending_actions.pop(m.from_user.id, None)
+                    await m.answer("Ок, не отправляю одиночный вопрос.", reply_markup=_main_menu())
+                    return
+
+                await m.answer(
+                    "Отправить этот одиночный вопрос? Нажмите кнопку или напишите «да» / «нет».",
+                    reply_markup=_single_question_menu(),
+                )
+                return
+
+        try:
+            parse_quiz_text(text)
+        except ParseError:
+            pass
+        else:
+            channel_id = await ensure_channel(m)
+            if not channel_id:
+                pending_actions[m.from_user.id] = {
+                    "mode": "single_question_confirm",
+                    "question_text": text,
+                }
+                return
+
+            pending_actions[m.from_user.id] = {
+                "mode": "single_question_confirm",
+                "question_text": text,
+            }
+            await show_single_question_choice(m, text, channel_id)
+            return
 
         await m.answer(
             "Чтобы создать тест, нажмите «Создать тест» или отправьте /test. Вопросы теперь добавляются только по одному в этом режиме.",
