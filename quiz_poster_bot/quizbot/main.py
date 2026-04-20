@@ -8,7 +8,7 @@ import re
 import time
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -111,7 +111,7 @@ def _format_when(timestamp: float) -> str:
 async def _channel_display_name(bot: Bot, channel_id: str) -> str:
     try:
         chat = await _send_telegram(bot.get_chat, chat_id=channel_id)
-    except TelegramBadRequest:
+    except TelegramAPIError:
         logger.warning("Could not resolve channel title for %s", channel_id, exc_info=True)
         return channel_id
 
@@ -711,6 +711,13 @@ def build_router(
         pending: dict[str, object],
     ) -> None:
         questions = builder_questions(pending)
+        if not questions:
+            await message.answer("В тесте пока нет вопросов.", reply_markup=_main_menu())
+            return
+
+        await message.answer(
+            f"Начинаю отправку теста: {len(questions)} вопрос(ов). Это может занять немного времени.",
+        )
         try:
             msg = await _post_built_quiz(
                 bot=bot,
@@ -722,6 +729,22 @@ def build_router(
             )
         except ParseError as e:
             await message.answer(f"Не смог отправить тест: {e}", reply_markup=_main_menu())
+            return
+        except TelegramAPIError as e:
+            logger.exception("Could not publish built quiz to %s", channel_id)
+            await message.answer(
+                "Не смог отправить тест в канал. Проверьте, что бот добавлен в канал администратором "
+                "и у него есть право публиковать сообщения и опросы.\n\n"
+                f"Ошибка Telegram: {e.message}",
+                reply_markup=_main_menu(),
+            )
+            return
+        except Exception:
+            logger.exception("Unexpected error while publishing built quiz to %s", channel_id)
+            await message.answer(
+                "Не смог отправить тест из-за неожиданной ошибки. Подробности записаны в лог бота.",
+                reply_markup=_main_menu(),
+            )
             return
         await message.answer(msg, reply_markup=_main_menu())
 
@@ -903,8 +926,8 @@ def build_router(
         pending_actions.pop(c.from_user.id, None)
         users_waiting_for_channel.add(c.from_user.id)
         channel_id = channel_store.get(c.from_user.id) or cfg.target_channel_id
-        await _ask_channel_change(message=c.message, bot=bot, channel_id=channel_id)
         await c.answer()
+        await _ask_channel_change(message=c.message, bot=bot, channel_id=channel_id)
 
     @router.callback_query(F.data == "menu:help")
     async def menu_help(c: CallbackQuery) -> None:
@@ -964,8 +987,8 @@ def build_router(
             await c.answer()
             return
 
-        await publish_builder_now(message=c.message, channel_id=channel_id, pending=pending)
         await c.answer()
+        await publish_builder_now(message=c.message, channel_id=channel_id, pending=pending)
 
     @router.callback_query(F.data.startswith("saved_schedule:"))
     async def saved_schedule(c: CallbackQuery) -> None:
@@ -1055,8 +1078,8 @@ def build_router(
             await c.answer()
             return
 
-        await publish_builder_now(message=c.message, channel_id=channel_id, pending=pending)
         await c.answer()
+        await publish_builder_now(message=c.message, channel_id=channel_id, pending=pending)
 
     @router.callback_query(F.data == "builder:save")
     async def builder_save(c: CallbackQuery) -> None:
