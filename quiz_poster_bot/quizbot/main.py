@@ -8,7 +8,7 @@ import re
 import time
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -104,6 +104,22 @@ def _parse_delay(raw: str) -> int | None:
 
 def _format_when(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%d.%m.%Y %H:%M:%S")
+
+
+async def _channel_display_name(bot: Bot, channel_id: str) -> str:
+    try:
+        chat = await _send_telegram(bot.get_chat, chat_id=channel_id)
+    except TelegramBadRequest:
+        logger.warning("Could not resolve channel title for %s", channel_id, exc_info=True)
+        return channel_id
+
+    title = getattr(chat, "title", None)
+    username = getattr(chat, "username", None)
+    if title:
+        return str(title)
+    if username:
+        return f"@{username}"
+    return channel_id
 
 
 def _main_menu() -> InlineKeyboardMarkup:
@@ -574,8 +590,9 @@ def build_router(
             await _ask_channel_id(m)
             return
 
+        channel_name = await _channel_display_name(bot, channel_id)
         await m.answer(
-            f"Текущий канал: {channel_id}\n\n"
+            f"Текущий канал: {channel_name}\n\n"
             "Создавайте тест пошагово: тема, сообщение перед тестом, вопросы по одному, затем отправка сейчас или отложенная отправка.",
             reply_markup=_main_menu(),
         )
@@ -829,18 +846,19 @@ def build_router(
 
             channel_store.set(m.from_user.id, channel_id)
             users_waiting_for_channel.discard(m.from_user.id)
+            channel_name = await _channel_display_name(bot, channel_id)
             pending = pending_actions.get(m.from_user.id)
             if pending and pending.get("mode") in {"builder_ready", "builder_delay"}:
                 pending["mode"] = "builder_ready"
                 await m.answer(
-                    f"Канал сохранен: {channel_id}\n\n"
+                    f"Канал сохранен: {channel_name}\n\n"
                     "Можно отправить готовый тест сейчас или отложить.",
                     reply_markup=_builder_send_menu(),
                 )
                 return
 
             await m.answer(
-                f"Канал сохранен: {channel_id}\n"
+                f"Канал сохранен: {channel_name}\n"
                 "Теперь он используется по умолчанию. Чтобы заменить канал, отправьте /channel.",
                 reply_markup=_main_menu(),
             )
