@@ -82,6 +82,16 @@ class ScheduledQuizJob:
     created_at: float
 
 
+@dataclass(frozen=True)
+class SavedQuiz:
+    id: str
+    user_id: int
+    topic: str | None
+    intro_text: str | None
+    questions: list[ScheduledQuizQuestion]
+    created_at: float
+
+
 class ScheduledQuizStore:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -201,6 +211,109 @@ class ScheduledQuizStore:
                 "created_at": job.created_at,
             }
             for job in self.list_all()
+        ]
+        self._path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+class SavedQuizStore:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._quizzes = self._load()
+
+    def add(
+        self,
+        *,
+        user_id: int,
+        topic: str | None,
+        intro_text: str | None,
+        questions: list[ScheduledQuizQuestion],
+    ) -> SavedQuiz:
+        quiz = SavedQuiz(
+            id=uuid4().hex,
+            user_id=user_id,
+            topic=topic,
+            intro_text=intro_text,
+            questions=questions,
+            created_at=time.time(),
+        )
+        self._quizzes[quiz.id] = quiz
+        self._save()
+        return quiz
+
+    def get(self, quiz_id: str) -> SavedQuiz | None:
+        return self._quizzes.get(quiz_id)
+
+    def remove(self, quiz_id: str) -> None:
+        if quiz_id in self._quizzes:
+            del self._quizzes[quiz_id]
+            self._save()
+
+    def list_for_user(self, user_id: int) -> list[SavedQuiz]:
+        return sorted(
+            (quiz for quiz in self._quizzes.values() if quiz.user_id == user_id),
+            key=lambda quiz: quiz.created_at,
+            reverse=True,
+        )
+
+    def _load(self) -> dict[str, SavedQuiz]:
+        if not self._path.exists():
+            return {}
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, list):
+            return {}
+
+        quizzes: dict[str, SavedQuiz] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                quiz = SavedQuiz(
+                    id=str(item["id"]),
+                    user_id=int(item["user_id"]),
+                    topic=str(item["topic"]) if item.get("topic") else None,
+                    intro_text=str(item["intro_text"]) if item.get("intro_text") else None,
+                    questions=[
+                        ScheduledQuizQuestion(
+                            text=str(question["text"]),
+                            photo_file_id=str(question["photo_file_id"])
+                            if question.get("photo_file_id")
+                            else None,
+                        )
+                        for question in item.get("questions", [])
+                        if isinstance(question, dict) and question.get("text")
+                    ],
+                    created_at=float(item.get("created_at", time.time())),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if quiz.questions:
+                quizzes[quiz.id] = quiz
+        return quizzes
+
+    def _save(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        payload = [
+            {
+                "id": quiz.id,
+                "user_id": quiz.user_id,
+                "topic": quiz.topic,
+                "intro_text": quiz.intro_text,
+                "questions": [
+                    {
+                        "text": question.text,
+                        "photo_file_id": question.photo_file_id,
+                    }
+                    for question in quiz.questions
+                ],
+                "created_at": quiz.created_at,
+            }
+            for quiz in sorted(self._quizzes.values(), key=lambda item: item.created_at, reverse=True)
         ]
         self._path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),

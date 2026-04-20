@@ -16,6 +16,8 @@ from .config import load_config
 from .parser import ParsedQuiz, ParseError, parse_quiz_block_text, parse_quiz_text
 from .state import (
     ChannelSelectionStore,
+    SavedQuiz,
+    SavedQuizStore,
     ScheduledQuizJob,
     ScheduledQuizQuestion,
     ScheduledQuizStore,
@@ -126,6 +128,7 @@ def _main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Создать тест", callback_data="menu:test")],
+            [InlineKeyboardButton(text="Сохраненные тесты", callback_data="menu:saved")],
             [
                 InlineKeyboardButton(text="Очередь", callback_data="menu:scheduled"),
                 InlineKeyboardButton(text="Канал", callback_data="menu:channel"),
@@ -145,6 +148,7 @@ def _builder_question_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Готово, перейти к отправке", callback_data="builder:finish")],
+            [InlineKeyboardButton(text="Отменить текущий вопрос", callback_data="builder:cancel_question")],
             [InlineKeyboardButton(text="Отмена", callback_data="menu:cancel")],
         ]
     )
@@ -157,6 +161,7 @@ def _builder_send_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Отправить сейчас", callback_data="builder:send_now"),
                 InlineKeyboardButton(text="Отложить", callback_data="builder:schedule"),
             ],
+            [InlineKeyboardButton(text="Сохранить тест", callback_data="builder:save")],
             [InlineKeyboardButton(text="Отмена", callback_data="menu:cancel")],
         ]
     )
@@ -189,6 +194,19 @@ def _single_question_menu() -> InlineKeyboardMarkup:
     )
 
 
+def _saved_quiz_actions_menu(quiz_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Отправить сейчас", callback_data=f"saved_send:{quiz_id}"),
+                InlineKeyboardButton(text="Отложить", callback_data=f"saved_schedule:{quiz_id}"),
+            ],
+            [InlineKeyboardButton(text="Удалить", callback_data=f"saved_delete:{quiz_id}")],
+            [InlineKeyboardButton(text="Назад к сохраненным", callback_data="menu:saved")],
+        ]
+    )
+
+
 def _help_text() -> str:
     return (
         "Кнопка «Создать тест» запускает пошаговое создание: тема, сообщение перед тестом, вопросы по одному, затем отправка сейчас или отложенная отправка.\n"
@@ -215,6 +233,32 @@ def _scheduled_text(schedule_store: ScheduledQuizStore) -> str:
     for job in jobs:
         topic = f" - {job.topic}" if job.topic else ""
         lines.append(f"{job.id[:8]}: {_format_when(job.send_at)}{topic} -> {job.channel_id}")
+    return "\n".join(lines)
+
+
+def _saved_quiz_title(quiz: SavedQuiz) -> str:
+    title = quiz.topic or "Без темы"
+    return f"{title} ({len(quiz.questions)} вопр.)"
+
+
+def _saved_quizzes_menu(saved_store: SavedQuizStore, user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=_saved_quiz_title(quiz), callback_data=f"saved_open:{quiz.id}")]
+        for quiz in saved_store.list_for_user(user_id)[:20]
+    ]
+    rows.append([InlineKeyboardButton(text="Создать тест", callback_data="menu:test")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _saved_quizzes_text(saved_store: SavedQuizStore, user_id: int) -> str:
+    quizzes = saved_store.list_for_user(user_id)
+    if not quizzes:
+        return "Сохраненных тестов пока нет. Создайте тест и нажмите «Сохранить тест»."
+
+    lines = ["Сохраненные тесты:"]
+    for index, quiz in enumerate(quizzes[:20], start=1):
+        lines.append(f"{index}. {_saved_quiz_title(quiz)} - {quiz.id[:8]}")
     return "\n".join(lines)
 
 
@@ -473,6 +517,7 @@ def build_router(
     bot: Bot,
     channel_store: ChannelSelectionStore,
     schedule_store: ScheduledQuizStore,
+    saved_store: SavedQuizStore,
     cfg,
 ) -> Router:
     router = Router()
@@ -517,6 +562,16 @@ def build_router(
             return questions
         return []
 
+    def saved_to_pending(quiz: SavedQuiz, *, mode: str = "saved_ready") -> dict[str, object]:
+        return {
+            "mode": mode,
+            "saved_quiz_id": quiz.id,
+            "topic": quiz.topic,
+            "intro_text": quiz.intro_text,
+            "questions": list(quiz.questions),
+            "pending_photo_file_id": None,
+        }
+
     async def add_builder_question(
         *,
         m: Message,
@@ -553,6 +608,32 @@ def build_router(
         await m.answer(
             f"Добавил вопрос #{len(questions)}.\n\n"
             "Пришлите следующий вопрос текстом или фото с подписью. Когда вопросы закончатся, нажмите «Готово» или напишите «готово».",
+            reply_markup=_builder_question_menu(),
+        )
+
+    async def cancel_builder_question(message: Message, pending: dict[str, object]) -> None:
+        if pending.get("pending_photo_file_id"):
+            pending["pending_photo_file_id"] = None
+            await message.answer(
+                "Отменил фото для текущего вопроса. Уже добавленные вопросы остались на месте.",
+                reply_markup=_builder_question_menu(),
+            )
+            return
+
+        questions = builder_questions(pending)
+        if not questions:
+            await message.answer(
+                "Пока нечего отменять: в тесте еще нет добавленных вопросов.",
+                reply_markup=_builder_question_menu(),
+            )
+            return
+
+        removed = questions.pop()
+        pending["questions"] = questions
+        parsed = parse_quiz_text(removed.text)
+        await message.answer(
+            f"Удалил последний добавленный вопрос: {parsed.question}\n\n"
+            f"В тесте осталось вопросов: {len(questions)}.",
             reply_markup=_builder_question_menu(),
         )
 
@@ -654,6 +735,39 @@ def build_router(
             reply_markup=_main_menu(),
         )
 
+    async def show_saved_quizzes(message: Message, user_id: int) -> None:
+        await message.answer(
+            _saved_quizzes_text(saved_store, user_id),
+            reply_markup=_saved_quizzes_menu(saved_store, user_id),
+        )
+
+    async def show_saved_quiz(message: Message, quiz: SavedQuiz) -> None:
+        created_at = _format_when(quiz.created_at)
+        await message.answer(
+            f"Сохраненный тест: {_saved_quiz_title(quiz)}\n"
+            f"Создан: {created_at}\n\n"
+            "Можно отправить его заново для перепрохождения или поставить в очередь.",
+            reply_markup=_saved_quiz_actions_menu(quiz.id),
+        )
+
+    async def save_builder_quiz(message: Message, user_id: int, pending: dict[str, object]) -> None:
+        questions = builder_questions(pending)
+        if not questions:
+            await message.answer("В тесте пока нет вопросов.", reply_markup=_main_menu())
+            return
+
+        quiz = saved_store.add(
+            user_id=user_id,
+            topic=str(pending.get("topic") or "") or None,
+            intro_text=str(pending.get("intro_text") or "") or None,
+            questions=list(questions),
+        )
+        await message.answer(
+            f"Сохранил тест «{quiz.topic or 'Без темы'}»: {len(quiz.questions)} вопр.\n"
+            "Теперь его можно открыть в «Сохраненные тесты» и отправить заново.",
+            reply_markup=_main_menu(),
+        )
+
     @router.message(CommandStart())
     async def start(m: Message) -> None:
         if not _is_allowed(m, cfg.admin_user_id):
@@ -697,6 +811,15 @@ def build_router(
 
         await m.answer(_scheduled_text(schedule_store), reply_markup=_main_menu())
 
+    @router.message(Command("saved"))
+    async def saved_cmd(m: Message) -> None:
+        if not _is_allowed(m, cfg.admin_user_id):
+            return
+        if not m.from_user:
+            return
+
+        await show_saved_quizzes(m, m.from_user.id)
+
     @router.message(Command("test"))
     async def test_cmd(m: Message) -> None:
         if not _is_allowed(m, cfg.admin_user_id):
@@ -718,6 +841,15 @@ def build_router(
         await start_builder_dialog(c.message, c.from_user.id)
         await c.answer()
 
+    @router.callback_query(F.data == "menu:main")
+    async def menu_main(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        await c.message.answer("Главное меню.", reply_markup=_main_menu())
+        await c.answer()
+
     @router.callback_query(F.data == "menu:scheduled")
     async def menu_scheduled(c: CallbackQuery) -> None:
         if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
@@ -725,6 +857,15 @@ def build_router(
             return
 
         await c.message.answer(_scheduled_text(schedule_store), reply_markup=_main_menu())
+        await c.answer()
+
+    @router.callback_query(F.data == "menu:saved")
+    async def menu_saved(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        await show_saved_quizzes(c.message, c.from_user.id)
         await c.answer()
 
     @router.callback_query(F.data == "menu:channel")
@@ -764,6 +905,85 @@ def build_router(
         await c.message.answer("Ок, отменил текущее действие.", reply_markup=_main_menu())
         await c.answer()
 
+    @router.callback_query(F.data.startswith("saved_open:"))
+    async def saved_open(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        quiz_id = (c.data or "").split(":", 1)[1]
+        quiz = saved_store.get(quiz_id)
+        if not quiz or quiz.user_id != c.from_user.id:
+            await c.message.answer("Не нашел этот сохраненный тест.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        await show_saved_quiz(c.message, quiz)
+        await c.answer()
+
+    @router.callback_query(F.data.startswith("saved_send:"))
+    async def saved_send(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        quiz_id = (c.data or "").split(":", 1)[1]
+        quiz = saved_store.get(quiz_id)
+        if not quiz or quiz.user_id != c.from_user.id:
+            await c.message.answer("Не нашел этот сохраненный тест.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        channel_id = channel_store.get(c.from_user.id) or cfg.target_channel_id
+        pending = saved_to_pending(quiz)
+        if not channel_id:
+            pending_actions[c.from_user.id] = pending
+            users_waiting_for_channel.add(c.from_user.id)
+            await _ask_channel_id(c.message)
+            await c.answer()
+            return
+
+        await publish_builder_now(message=c.message, channel_id=channel_id, pending=pending)
+        await c.answer()
+
+    @router.callback_query(F.data.startswith("saved_schedule:"))
+    async def saved_schedule(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        quiz_id = (c.data or "").split(":", 1)[1]
+        quiz = saved_store.get(quiz_id)
+        if not quiz or quiz.user_id != c.from_user.id:
+            await c.message.answer("Не нашел этот сохраненный тест.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        pending_actions[c.from_user.id] = saved_to_pending(quiz, mode="saved_delay")
+        await c.message.answer(
+            "Через сколько отправить сохраненный тест?\n\n"
+            "Можно выбрать кнопку или написать свое значение: 30m, 1h, 2h, 1d.",
+            reply_markup=_builder_delay_menu(),
+        )
+        await c.answer()
+
+    @router.callback_query(F.data.startswith("saved_delete:"))
+    async def saved_delete(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        quiz_id = (c.data or "").split(":", 1)[1]
+        quiz = saved_store.get(quiz_id)
+        if not quiz or quiz.user_id != c.from_user.id:
+            await c.message.answer("Не нашел этот сохраненный тест.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        saved_store.remove(quiz.id)
+        await c.message.answer("Удалил сохраненный тест.", reply_markup=_main_menu())
+        await c.answer()
+
     @router.callback_query(F.data == "builder:finish")
     async def builder_finish(c: CallbackQuery) -> None:
         if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
@@ -777,6 +997,21 @@ def build_router(
             return
 
         await show_builder_send_choice(c.message, pending)
+        await c.answer()
+
+    @router.callback_query(F.data == "builder:cancel_question")
+    async def builder_cancel_question(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        pending = pending_actions.get(c.from_user.id)
+        if not pending or pending.get("mode") != "builder_questions":
+            await c.message.answer("Сейчас нет текущего вопроса для отмены.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        await cancel_builder_question(c.message, pending)
         await c.answer()
 
     @router.callback_query(F.data == "builder:send_now")
@@ -800,6 +1035,21 @@ def build_router(
             return
 
         await publish_builder_now(message=c.message, channel_id=channel_id, pending=pending)
+        await c.answer()
+
+    @router.callback_query(F.data == "builder:save")
+    async def builder_save(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        pending = pending_actions.pop(c.from_user.id, None)
+        if not pending or pending.get("mode") != "builder_ready":
+            await c.message.answer("Сейчас нет готового теста для сохранения.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        await save_builder_quiz(c.message, c.from_user.id, pending)
         await c.answer()
 
     @router.callback_query(F.data == "single:send")
@@ -856,7 +1106,7 @@ def build_router(
             return
 
         pending = pending_actions.get(c.from_user.id)
-        if not pending or pending.get("mode") not in {"builder_ready", "builder_delay"}:
+        if not pending or pending.get("mode") not in {"builder_ready", "builder_delay", "saved_ready", "saved_delay"}:
             await c.message.answer("Сейчас нет готового теста.", reply_markup=_main_menu())
             await c.answer()
             return
@@ -959,7 +1209,17 @@ def build_router(
                 await show_single_question_choice(m, question_text, channel_id)
                 return
 
-            if pending and pending.get("mode") in {"builder_ready", "builder_delay"}:
+            if pending and pending.get("mode") in {"builder_ready", "builder_delay", "saved_ready", "saved_delay"}:
+                if pending.get("saved_quiz_id"):
+                    quiz_id = str(pending.get("saved_quiz_id"))
+                    pending["mode"] = "saved_ready"
+                    await m.answer(
+                        f"Канал сохранен: {channel_name}\n\n"
+                        "Можно отправить сохраненный тест сейчас или отложить.",
+                        reply_markup=_saved_quiz_actions_menu(quiz_id),
+                    )
+                    return
+
                 pending["mode"] = "builder_ready"
                 await m.answer(
                     f"Канал сохранен: {channel_name}\n\n"
@@ -1014,10 +1274,14 @@ def build_router(
                 return
 
             if mode == "builder_questions":
+                if text.lower() in {"отменить вопрос", "удалить вопрос", "назад", "undo", "cancel question"}:
+                    await cancel_builder_question(m, pending)
+                    return
+
                 if text.lower() in {"готово", "done", "finish", "стоп"}:
                     if pending.get("pending_photo_file_id"):
                         await m.answer(
-                            "К последнему фото еще нужен текст вопроса. Пришлите вопрос или отмените создание теста.",
+                            "К последнему фото еще нужен текст вопроса. Пришлите вопрос или нажмите «Отменить текущий вопрос».",
                             reply_markup=_builder_question_menu(),
                         )
                         return
@@ -1033,7 +1297,7 @@ def build_router(
                 )
                 return
 
-            if mode == "builder_ready":
+            if mode in {"builder_ready", "saved_ready"}:
                 delay_seconds = _parse_delay(text)
                 channel_id = await ensure_channel(m)
                 if not channel_id:
@@ -1057,7 +1321,7 @@ def build_router(
                 await show_builder_send_choice(m, pending)
                 return
 
-            if mode == "builder_delay":
+            if mode in {"builder_delay", "saved_delay"}:
                 delay_seconds = _parse_delay(text)
                 if delay_seconds is None:
                     await m.answer(
@@ -1149,6 +1413,7 @@ async def main() -> None:
             BotCommand(command="start", description="Открыть меню"),
             BotCommand(command="help", description="Показать формат вопросов"),
             BotCommand(command="test", description="Создать тест пошагово"),
+            BotCommand(command="saved", description="Показать сохраненные тесты"),
             BotCommand(command="scheduled", description="Показать очередь"),
             BotCommand(command="channel", description="Сменить канал"),
         ]
@@ -1157,6 +1422,7 @@ async def main() -> None:
     base_path = Path(__file__).resolve().parent.parent
     channel_store = ChannelSelectionStore(base_path / "channel_selections.json")
     schedule_store = ScheduledQuizStore(base_path / "scheduled_quizzes.json")
+    saved_store = SavedQuizStore(base_path / "saved_quizzes.json")
 
     for job in schedule_store.list_all():
         _schedule_job_task(bot=bot, job=job, schedule_store=schedule_store, cfg=cfg)
@@ -1166,6 +1432,7 @@ async def main() -> None:
             bot=bot,
             channel_store=channel_store,
             schedule_store=schedule_store,
+            saved_store=saved_store,
             cfg=cfg,
         )
     )
