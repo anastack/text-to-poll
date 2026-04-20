@@ -13,7 +13,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .config import load_config
-from .parser import ParseError, parse_quiz_block_text, parse_quiz_text
+from .parser import ParsedQuiz, ParseError, parse_quiz_block_text, parse_quiz_text
 from .state import (
     ChannelSelectionStore,
     ScheduledQuizJob,
@@ -239,6 +239,18 @@ async def _send_parsed_quiz(
     if channel_id.startswith("@") or channel_id.startswith("-100"):
         poll_anonymous = True
 
+    if not parsed.correct_option_ids:
+        await _send_telegram(
+            bot.send_poll,
+            chat_id=channel_id,
+            question=parsed.question,
+            options=parsed.options,
+            type="regular",
+            is_anonymous=poll_anonymous,
+            allows_multiple_answers=poll_multiple_answers,
+        )
+        return
+
     if parsed.has_multiple_correct_options:
         await _send_telegram(
             bot.send_poll,
@@ -261,6 +273,29 @@ async def _send_parsed_quiz(
         is_anonymous=poll_anonymous,
         allows_multiple_answers=poll_multiple_answers,
     )
+
+
+def _parse_single_question_text(text: str) -> ParsedQuiz:
+    try:
+        return parse_quiz_text(text)
+    except ParseError as e:
+        if "пометьте правильный ответ" not in str(e):
+            raise
+
+    lines = [ln.strip() for ln in text.replace("\r\n", "\n").split("\n")]
+    lines = [ln for ln in lines if ln]
+    if len(lines) < 3:
+        raise ParseError("Нужно минимум 1 вопрос и 2 варианта ответа.")
+
+    question = lines[0]
+    options = [ln.lstrip("*+").strip() for ln in lines[1:]]
+    options = [opt for opt in options if opt]
+    if len(options) < 2:
+        raise ParseError("Нужно минимум 2 варианта ответа.")
+    if len(options) > 10:
+        raise ParseError("Telegram поддерживает максимум 10 вариантов.")
+
+    return ParsedQuiz(question=question, options=options, correct_option_ids=[])
 
 
 async def _send_telegram(method, *args, **kwargs):
@@ -535,10 +570,11 @@ def build_router(
         )
 
     async def show_single_question_choice(message: Message, question_text: str, channel_id: str) -> None:
-        parsed = parse_quiz_text(question_text)
+        parsed = _parse_single_question_text(question_text)
+        poll_type = "квиз" if parsed.correct_option_ids else "обычный опрос"
         channel_name = await _channel_display_name(bot, channel_id)
         await message.answer(
-            f"Похоже, это одиночный вопрос:\n\n{parsed.question}\n\n"
+            f"Похоже, это одиночный вопрос ({poll_type}):\n\n{parsed.question}\n\n"
             f"Отправить его в канал {channel_name}?",
             reply_markup=_single_question_menu(),
         )
@@ -550,7 +586,7 @@ def build_router(
         question_text: str,
     ) -> None:
         try:
-            parsed = parse_quiz_text(question_text)
+            parsed = _parse_single_question_text(question_text)
             await _send_parsed_quiz(
                 bot=bot,
                 channel_id=channel_id,
@@ -1071,7 +1107,7 @@ def build_router(
                 return
 
         try:
-            parse_quiz_text(text)
+            _parse_single_question_text(text)
         except ParseError:
             pass
         else:
