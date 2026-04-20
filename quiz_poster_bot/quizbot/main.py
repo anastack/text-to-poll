@@ -272,6 +272,28 @@ async def _ask_channel_id(m: Message) -> None:
     )
 
 
+async def _ask_channel_change(
+    *,
+    message: Message,
+    bot: Bot,
+    channel_id: str | None,
+) -> None:
+    prefix = ""
+    if channel_id:
+        channel_name = await _channel_display_name(bot, channel_id)
+        prefix = f"Текущий канал: {channel_name} ({channel_id})\n\n"
+
+    await message.answer(
+        prefix
+        + "Пришлите новый ID канала, куда публиковать викторины.\n\n"
+        "Примеры:\n"
+        "-1001234567890\n"
+        "@your_public_channel\n\n"
+        "Бот должен быть админом этого канала.",
+        reply_markup=_cancel_menu(),
+    )
+
+
 async def _send_parsed_quiz(
     *,
     bot: Bot,
@@ -798,7 +820,8 @@ def build_router(
 
         pending_actions.pop(m.from_user.id, None)
         users_waiting_for_channel.add(m.from_user.id)
-        await _ask_channel_id(m)
+        channel_id = channel_store.get(m.from_user.id) or cfg.target_channel_id
+        await _ask_channel_change(message=m, bot=bot, channel_id=channel_id)
 
     @router.message(Command("help"))
     async def help_cmd(m: Message) -> None:
@@ -879,10 +902,8 @@ def build_router(
 
         pending_actions.pop(c.from_user.id, None)
         users_waiting_for_channel.add(c.from_user.id)
-        await c.message.answer(
-            "Пришлите новый ID канала: -1001234567890 или @your_public_channel.",
-            reply_markup=_cancel_menu(),
-        )
+        channel_id = channel_store.get(c.from_user.id) or cfg.target_channel_id
+        await _ask_channel_change(message=c.message, bot=bot, channel_id=channel_id)
         await c.answer()
 
     @router.callback_query(F.data == "menu:help")
