@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import time
@@ -77,6 +77,7 @@ class ScheduledQuizJob:
     photo_file_id: str | None
     intro_text: str | None
     questions: list[ScheduledQuizQuestion]
+    published_question_count: int
     send_at: float
     created_at: float
 
@@ -107,6 +108,7 @@ class ScheduledQuizStore:
             photo_file_id=photo_file_id,
             intro_text=intro_text,
             questions=questions or [],
+            published_question_count=0,
             send_at=send_at,
             created_at=time.time(),
         )
@@ -118,6 +120,18 @@ class ScheduledQuizStore:
         if job_id in self._jobs:
             del self._jobs[job_id]
             self._save()
+
+    def mark_progress(self, job_id: str, published_question_count: int) -> None:
+        job = self._jobs.get(job_id)
+        if not job:
+            return
+
+        safe_count = max(0, min(published_question_count, len(job.questions)))
+        if safe_count == job.published_question_count:
+            return
+
+        self._jobs[job_id] = replace(job, published_question_count=safe_count)
+        self._save()
 
     def list_all(self) -> list[ScheduledQuizJob]:
         return sorted(self._jobs.values(), key=lambda job: job.send_at)
@@ -155,6 +169,7 @@ class ScheduledQuizStore:
                         for question in item.get("questions", [])
                         if isinstance(question, dict) and question.get("text")
                     ],
+                    published_question_count=int(item.get("published_question_count", 0)),
                     send_at=float(item["send_at"]),
                     created_at=float(item.get("created_at", time.time())),
                 )
@@ -181,6 +196,7 @@ class ScheduledQuizStore:
                     }
                     for question in job.questions
                 ],
+                "published_question_count": job.published_question_count,
                 "send_at": job.send_at,
                 "created_at": job.created_at,
             }
