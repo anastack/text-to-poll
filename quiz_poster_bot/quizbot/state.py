@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
 import time
@@ -61,10 +61,22 @@ class ChannelSelectionStore:
         )
 
 
+def _question_photo_ids(raw_question: dict) -> list[str]:
+    raw_file_ids = raw_question.get("photo_file_ids")
+    if isinstance(raw_file_ids, list):
+        return [str(file_id) for file_id in raw_file_ids if file_id]
+
+    legacy_file_id = raw_question.get("photo_file_id")
+    if legacy_file_id:
+        return [str(legacy_file_id)]
+
+    return []
+
+
 @dataclass(frozen=True)
 class ScheduledQuizQuestion:
     text: str
-    photo_file_id: str | None = None
+    photo_file_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -172,9 +184,7 @@ class ScheduledQuizStore:
                     questions=[
                         ScheduledQuizQuestion(
                             text=str(question["text"]),
-                            photo_file_id=str(question["photo_file_id"])
-                            if question.get("photo_file_id")
-                            else None,
+                            photo_file_ids=_question_photo_ids(question),
                         )
                         for question in item.get("questions", [])
                         if isinstance(question, dict) and question.get("text")
@@ -202,7 +212,7 @@ class ScheduledQuizStore:
                 "questions": [
                     {
                         "text": question.text,
-                        "photo_file_id": question.photo_file_id,
+                        "photo_file_ids": question.photo_file_ids,
                     }
                     for question in job.questions
                 ],
@@ -251,6 +261,22 @@ class SavedQuizStore:
             del self._quizzes[quiz_id]
             self._save()
 
+    def update(
+        self,
+        quiz_id: str,
+        *,
+        topic: str | None,
+        intro_text: str | None,
+        questions: list[ScheduledQuizQuestion],
+    ) -> SavedQuiz | None:
+        quiz = self._quizzes.get(quiz_id)
+        if not quiz:
+            return None
+        updated = replace(quiz, topic=topic, intro_text=intro_text, questions=questions)
+        self._quizzes[quiz_id] = updated
+        self._save()
+        return updated
+
     def list_for_user(self, user_id: int) -> list[SavedQuiz]:
         return sorted(
             (quiz for quiz in self._quizzes.values() if quiz.user_id == user_id),
@@ -281,9 +307,7 @@ class SavedQuizStore:
                     questions=[
                         ScheduledQuizQuestion(
                             text=str(question["text"]),
-                            photo_file_id=str(question["photo_file_id"])
-                            if question.get("photo_file_id")
-                            else None,
+                            photo_file_ids=_question_photo_ids(question),
                         )
                         for question in item.get("questions", [])
                         if isinstance(question, dict) and question.get("text")
@@ -307,7 +331,7 @@ class SavedQuizStore:
                 "questions": [
                     {
                         "text": question.text,
-                        "photo_file_id": question.photo_file_id,
+                        "photo_file_ids": question.photo_file_ids,
                     }
                     for question in quiz.questions
                 ],
@@ -319,4 +343,3 @@ class SavedQuizStore:
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-

@@ -201,8 +201,26 @@ def _saved_quiz_actions_menu(quiz_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Отправить сейчас", callback_data=f"saved_send:{quiz_id}"),
                 InlineKeyboardButton(text="Отложить", callback_data=f"saved_schedule:{quiz_id}"),
             ],
-            [InlineKeyboardButton(text="Удалить", callback_data=f"saved_delete:{quiz_id}")],
+            [
+                InlineKeyboardButton(text="Редактировать", callback_data=f"saved_edit:{quiz_id}"),
+                InlineKeyboardButton(text="Удалить", callback_data=f"saved_delete:{quiz_id}"),
+            ],
             [InlineKeyboardButton(text="Назад к сохраненным", callback_data="menu:saved")],
+        ]
+    )
+
+
+def _saved_quiz_edit_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Изменить тему", callback_data="saved_edit_action:topic")],
+            [InlineKeyboardButton(text="Изменить вступление", callback_data="saved_edit_action:intro")],
+            [
+                InlineKeyboardButton(text="Добавить вопросы", callback_data="saved_edit_action:add_questions"),
+                InlineKeyboardButton(text="Удалить последний", callback_data="saved_edit_action:remove_question"),
+            ],
+            [InlineKeyboardButton(text="Сохранить изменения", callback_data="saved_edit_action:save")],
+            [InlineKeyboardButton(text="Отмена", callback_data="menu:cancel")],
         ]
     )
 
@@ -210,7 +228,7 @@ def _saved_quiz_actions_menu(quiz_id: str) -> InlineKeyboardMarkup:
 def _help_text() -> str:
     return (
         "Кнопка «Создать тест» запускает пошаговое создание: тема, сообщение перед тестом, вопросы по одному, затем отправка сейчас или отложенная отправка.\n"
-        "Вопрос можно прислать текстом или фото с подписью в формате вопроса.\n\n"
+        "Вопрос можно прислать текстом, фото с подписью или сначала отправить несколько фото, а потом текст вопроса.\n\n"
         "Формат одного вопроса:\n"
         "1-я строка - вопрос\n"
         "между вопросом и ответами можно оставлять пустые строки и пробелы\n"
@@ -412,8 +430,8 @@ async def _post_built_quiz(
 
     for question_number, question in enumerate(questions[start_index:], start=start_index + 1):
         parsed = parse_quiz_text(question.text)
-        if question.photo_file_id:
-            await _send_telegram(bot.send_photo, chat_id=channel_id, photo=question.photo_file_id)
+        for photo_file_id in question.photo_file_ids:
+            await _send_telegram(bot.send_photo, chat_id=channel_id, photo=photo_file_id)
             await asyncio.sleep(_POST_PAUSE_SECONDS)
         await _send_parsed_quiz(
             bot=bot,
@@ -564,7 +582,7 @@ def build_router(
             "topic": None,
             "intro_text": None,
             "questions": [],
-            "pending_photo_file_id": None,
+            "pending_photo_file_ids": [],
         }
 
     async def start_builder_dialog(message: Message, user_id: int) -> None:
@@ -584,6 +602,17 @@ def build_router(
             return questions
         return []
 
+    def builder_pending_photo_file_ids(pending: dict[str, object]) -> list[str]:
+        photo_file_ids = pending.get("pending_photo_file_ids")
+        if isinstance(photo_file_ids, list):
+            return [str(photo_file_id) for photo_file_id in photo_file_ids if photo_file_id]
+
+        legacy_photo_file_id = pending.get("pending_photo_file_id")
+        if legacy_photo_file_id:
+            return [str(legacy_photo_file_id)]
+
+        return []
+
     def saved_to_pending(quiz: SavedQuiz, *, mode: str = "saved_ready") -> dict[str, object]:
         return {
             "mode": mode,
@@ -591,7 +620,7 @@ def build_router(
             "topic": quiz.topic,
             "intro_text": quiz.intro_text,
             "questions": list(quiz.questions),
-            "pending_photo_file_id": None,
+            "pending_photo_file_ids": [],
         }
 
     async def add_builder_question(
@@ -599,13 +628,14 @@ def build_router(
         m: Message,
         pending: dict[str, object],
         text: str,
-        photo_file_id: str | None,
+        photo_file_ids: list[str] | None,
     ) -> None:
+        normalized_photo_file_ids = [str(photo_file_id) for photo_file_id in (photo_file_ids or []) if photo_file_id]
         try:
             parse_quiz_text(text)
         except ParseError as e:
-            if photo_file_id:
-                pending["pending_photo_file_id"] = photo_file_id
+            if normalized_photo_file_ids:
+                pending["pending_photo_file_ids"] = normalized_photo_file_ids
 
             error_text = str(e)
             if "пометьте правильный ответ" in error_text:
@@ -623,21 +653,21 @@ def build_router(
             return
 
         questions = builder_questions(pending)
-        questions.append(ScheduledQuizQuestion(text=text, photo_file_id=photo_file_id))
+        questions.append(ScheduledQuizQuestion(text=text, photo_file_ids=normalized_photo_file_ids))
         pending["questions"] = questions
-        pending["pending_photo_file_id"] = None
+        pending["pending_photo_file_ids"] = []
 
         await m.answer(
             f"Добавил вопрос #{len(questions)}.\n\n"
-            "Пришлите следующий вопрос текстом или фото с подписью. Когда вопросы закончатся, нажмите «Готово» или напишите «готово».",
+            "Можно прислать следующий вопрос текстом, фото с подписью или несколько фото подряд, а потом текст вопроса. Когда вопросы закончатся, нажмите «Готово» или напишите «готово».",
             reply_markup=_builder_question_menu(),
         )
 
     async def cancel_builder_question(message: Message, pending: dict[str, object]) -> None:
-        if pending.get("pending_photo_file_id"):
-            pending["pending_photo_file_id"] = None
+        if builder_pending_photo_file_ids(pending):
+            pending["pending_photo_file_ids"] = []
             await message.answer(
-                "Отменил фото для текущего вопроса. Уже добавленные вопросы остались на месте.",
+                "Отменил все картинки для текущего вопроса. Уже добавленные вопросы остались на месте.",
                 reply_markup=_builder_question_menu(),
             )
             return
@@ -811,6 +841,16 @@ def build_router(
             f"Сохранил тест «{quiz.topic or 'Без темы'}»: {len(quiz.questions)} вопр.\n"
             "Теперь его можно открыть в «Сохраненные тесты» и отправить заново.",
             reply_markup=_main_menu(),
+        )
+
+    async def show_saved_edit_menu(message: Message, pending: dict[str, object]) -> None:
+        questions = builder_questions(pending)
+        topic = pending.get("topic") or "Без темы"
+        await message.answer(
+            f"Редактирование теста «{topic}»\n"
+            f"Вопросов: {len(questions)}\n\n"
+            "Что хотите изменить?",
+            reply_markup=_saved_quiz_edit_menu(),
         )
 
     @router.message(CommandStart())
@@ -1028,6 +1068,107 @@ def build_router(
         await c.message.answer("Удалил сохраненный тест.", reply_markup=_main_menu())
         await c.answer()
 
+    @router.callback_query(F.data.startswith("saved_edit:"))
+    async def saved_edit_open(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        quiz_id = (c.data or "").split(":", 1)[1]
+        quiz = saved_store.get(quiz_id)
+        if not quiz or quiz.user_id != c.from_user.id:
+            await c.message.answer("Не нашел этот сохраненный тест.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        pending_actions[c.from_user.id] = {
+            "mode": "saved_edit",
+            "saved_quiz_id": quiz.id,
+            "topic": quiz.topic,
+            "intro_text": quiz.intro_text,
+            "questions": list(quiz.questions),
+            "pending_photo_file_ids": [],
+        }
+        await show_saved_edit_menu(c.message, pending_actions[c.from_user.id])
+        await c.answer()
+
+    @router.callback_query(F.data.startswith("saved_edit_action:"))
+    async def saved_edit_action(c: CallbackQuery) -> None:
+        if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
+            await c.answer()
+            return
+
+        pending = pending_actions.get(c.from_user.id)
+        if not pending or pending.get("mode") not in {"saved_edit", "saved_edit_questions"}:
+            await c.message.answer("Нет теста для редактирования.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        action = (c.data or "").split(":", 1)[1]
+
+        if action == "topic":
+            pending["mode"] = "saved_edit_topic"
+            await c.message.answer(
+                f"Текущая тема: {pending.get('topic') or 'Без темы'}\n\n"
+                "Напишите новую тему теста:",
+                reply_markup=_cancel_menu(),
+            )
+        elif action == "intro":
+            pending["mode"] = "saved_edit_intro"
+            await c.message.answer(
+                f"Текущее вступление:\n{pending.get('intro_text') or '(нет)'}\n\n"
+                "Напишите новый текст вступления или - чтобы убрать его:",
+                reply_markup=_cancel_menu(),
+            )
+        elif action == "add_questions":
+            pending["mode"] = "saved_edit_questions"
+            await c.message.answer(
+                "Присылайте новые вопросы по одному.\n"
+                "Когда закончите — нажмите «Готово, перейти к отправке» или напишите «готово».",
+                reply_markup=_builder_question_menu(),
+            )
+        elif action == "remove_question":
+            questions = builder_questions(pending)
+            if not questions:
+                await c.message.answer("В тесте нет вопросов для удаления.", reply_markup=_saved_quiz_edit_menu())
+                await c.answer()
+                return
+            removed = questions.pop()
+            pending["questions"] = questions
+            try:
+                parsed = parse_quiz_text(removed.text)
+                removed_label = parsed.question
+            except Exception:
+                removed_label = removed.text[:60]
+            await c.message.answer(
+                f"Удалил вопрос: {removed_label}\n"
+                f"Осталось вопросов: {len(questions)}.",
+                reply_markup=_saved_quiz_edit_menu(),
+            )
+        elif action == "save":
+            quiz_id = str(pending.get("saved_quiz_id") or "")
+            questions = builder_questions(pending)
+            if not questions:
+                await c.message.answer("В тесте нет вопросов. Добавьте хотя бы один.", reply_markup=_saved_quiz_edit_menu())
+                await c.answer()
+                return
+            updated = saved_store.update(
+                quiz_id,
+                topic=str(pending.get("topic") or "") or None,
+                intro_text=str(pending.get("intro_text") or "") or None,
+                questions=questions,
+            )
+            pending_actions.pop(c.from_user.id, None)
+            if updated:
+                await c.message.answer(
+                    f"Сохранил изменения в тесте «{updated.topic or 'Без темы'}»: {len(updated.questions)} вопр.",
+                    reply_markup=_main_menu(),
+                )
+            else:
+                await c.message.answer("Не нашел тест для сохранения.", reply_markup=_main_menu())
+
+        await c.answer()
+
     @router.callback_query(F.data == "builder:finish")
     async def builder_finish(c: CallbackQuery) -> None:
         if not c.message or not _is_callback_allowed(c, cfg.admin_user_id):
@@ -1035,8 +1176,14 @@ def build_router(
             return
 
         pending = pending_actions.get(c.from_user.id)
-        if not pending or pending.get("mode") not in {"builder_questions", "builder_ready"}:
+        if not pending or pending.get("mode") not in {"builder_questions", "builder_ready", "saved_edit_questions"}:
             await c.message.answer("Сейчас нет теста в сборке.", reply_markup=_main_menu())
+            await c.answer()
+            return
+
+        if pending.get("mode") == "saved_edit_questions":
+            pending["mode"] = "saved_edit"
+            await show_saved_edit_menu(c.message, pending)
             await c.answer()
             return
 
@@ -1050,7 +1197,7 @@ def build_router(
             return
 
         pending = pending_actions.get(c.from_user.id)
-        if not pending or pending.get("mode") != "builder_questions":
+        if not pending or pending.get("mode") not in {"builder_questions", "saved_edit_questions"}:
             await c.message.answer("Сейчас нет текущего вопроса для отмены.", reply_markup=_main_menu())
             await c.answer()
             return
@@ -1198,7 +1345,7 @@ def build_router(
             return
 
         pending = pending_actions.get(m.from_user.id)
-        if pending and pending.get("mode") == "builder_questions":
+        if pending and pending.get("mode") in {"builder_questions", "saved_edit_questions"}:
             photo = m.photo[-1]
             caption = (m.caption or "").strip()
             if caption:
@@ -1206,13 +1353,15 @@ def build_router(
                     m=m,
                     pending=pending,
                     text=caption,
-                    photo_file_id=photo.file_id,
+                    photo_file_ids=[photo.file_id],
                 )
                 return
 
-            pending["pending_photo_file_id"] = photo.file_id
+            photo_file_ids = builder_pending_photo_file_ids(pending)
+            photo_file_ids.append(photo.file_id)
+            pending["pending_photo_file_ids"] = photo_file_ids
             await m.answer(
-                "Фото принял. Теперь пришлите текст этого вопроса: вопрос первой строкой, ниже варианты ответов.",
+                f"Картинку #{len(photo_file_ids)} для текущего вопроса принял. Можно прислать еще картинки или сразу текст вопроса: вопрос первой строкой, ниже варианты ответов.",
                 reply_markup=_builder_question_menu(),
             )
             return
@@ -1312,7 +1461,7 @@ def build_router(
                     "Что выведет цикл?\n"
                     "*0 1 2\n"
                     "1 2 3\n\n"
-                    "Или фото с такой подписью. Когда закончите, нажмите «Готово» или напишите «готово».",
+                    "Или фото с такой подписью. Можно также прислать несколько фото подряд, а затем текст вопроса. Когда закончите, нажмите «Готово» или напишите «готово».",
                     reply_markup=_builder_question_menu(),
                 )
                 return
@@ -1323,21 +1472,21 @@ def build_router(
                     return
 
                 if text.lower() in {"готово", "done", "finish", "стоп"}:
-                    if pending.get("pending_photo_file_id"):
+                    if builder_pending_photo_file_ids(pending):
                         await m.answer(
-                            "К последнему фото еще нужен текст вопроса. Пришлите вопрос или нажмите «Отменить текущий вопрос».",
+                            "Для уже добавленных картинок еще нужен текст вопроса. Пришлите вопрос или нажмите «Отменить текущий вопрос».",
                             reply_markup=_builder_question_menu(),
                         )
                         return
                     await show_builder_send_choice(m, pending)
                     return
 
-                photo_file_id = pending.get("pending_photo_file_id")
+                photo_file_ids = builder_pending_photo_file_ids(pending)
                 await add_builder_question(
                     m=m,
                     pending=pending,
                     text=text,
-                    photo_file_id=str(photo_file_id) if photo_file_id else None,
+                    photo_file_ids=photo_file_ids,
                 )
                 return
 
@@ -1385,6 +1534,55 @@ def build_router(
                     channel_id=channel_id,
                     pending=pending,
                     delay_seconds=delay_seconds,
+                )
+                return
+
+            if mode == "saved_edit":
+                await show_saved_edit_menu(m, pending)
+                return
+
+            if mode == "saved_edit_topic":
+                topic = text.strip()
+                if not topic:
+                    await m.answer("Напишите тему теста.", reply_markup=_cancel_menu())
+                    return
+                pending["topic"] = topic
+                pending["intro_text"] = builder_intro(topic)
+                pending["mode"] = "saved_edit"
+                await show_saved_edit_menu(m, pending)
+                return
+
+            if mode == "saved_edit_intro":
+                if text in {"-", "—"}:
+                    pending["intro_text"] = None
+                else:
+                    pending["intro_text"] = text
+                pending["mode"] = "saved_edit"
+                await show_saved_edit_menu(m, pending)
+                return
+
+            if mode == "saved_edit_questions":
+                if text.lower() in {"отменить вопрос", "удалить вопрос", "назад", "undo", "cancel question"}:
+                    await cancel_builder_question(m, pending)
+                    return
+
+                if text.lower() in {"готово", "done", "finish", "стоп"}:
+                    if builder_pending_photo_file_ids(pending):
+                        await m.answer(
+                            "Для уже добавленных картинок еще нужен текст вопроса. Пришлите вопрос или нажмите «Отменить текущий вопрос».",
+                            reply_markup=_builder_question_menu(),
+                        )
+                        return
+                    pending["mode"] = "saved_edit"
+                    await show_saved_edit_menu(m, pending)
+                    return
+
+                photo_file_ids = builder_pending_photo_file_ids(pending)
+                await add_builder_question(
+                    m=m,
+                    pending=pending,
+                    text=text,
+                    photo_file_ids=photo_file_ids,
                 )
                 return
 

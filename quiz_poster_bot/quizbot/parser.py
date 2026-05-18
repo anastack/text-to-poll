@@ -29,6 +29,10 @@ class ParseError(ValueError):
     pass
 
 
+_TELEGRAM_QUESTION_LIMIT = 300
+_TELEGRAM_OPTION_LIMIT = 100
+
+
 _TOPIC_PREFIX_RE = re.compile(r"^(?:тема|topic)\s*:\s*(.+)$", re.IGNORECASE)
 
 
@@ -63,10 +67,19 @@ def parse_quiz_text(text: str) -> ParsedQuiz:
 
     if not question:
         raise ParseError("Вопрос пустой.")
+    if len(question) > _TELEGRAM_QUESTION_LIMIT:
+        raise ParseError(
+            f"Вопрос слишком длинный: {len(question)} симв. (максимум {_TELEGRAM_QUESTION_LIMIT}). Сократите вопрос."
+        )
     if len(options) < 2:
         raise ParseError("Нужно минимум 2 варианта ответа.")
     if len(options) > 10:
         raise ParseError("Telegram поддерживает максимум 10 вариантов. Укоротите список.")
+    for opt in options:
+        if len(opt) > _TELEGRAM_OPTION_LIMIT:
+            raise ParseError(
+                f"Вариант ответа слишком длинный: {len(opt)} симв. (максимум {_TELEGRAM_OPTION_LIMIT}). Сократите: «{opt[:40]}…»"
+            )
 
     if not correct_indices:
         raise ParseError("Отправьте вопрос еще раз и пометьте правильный ответ символом * или +.")
