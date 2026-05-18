@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 import logging
+import os
 from pathlib import Path
 import re
 import time
@@ -10,7 +11,7 @@ import time
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 
 from .config import load_config
 from .parser import ParsedQuiz, ParseError, parse_quiz_block_text, parse_quiz_text
@@ -183,6 +184,17 @@ def _builder_delay_menu() -> InlineKeyboardMarkup:
     )
 
 
+def _reply_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Создать тест"), KeyboardButton(text="Сохраненные тесты")],
+            [KeyboardButton(text="Очередь"), KeyboardButton(text="Сменить канал")],
+            [KeyboardButton(text="Помощь")],
+        ],
+        resize_keyboard=True,
+    )
+
+
 def _single_question_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -238,7 +250,16 @@ def _help_text() -> str:
         "Что выведет цикл?\n\n"
         "*0 1 2\n"
         "1 2 3\n"
-        "ошибка"
+        "ошибка\n\n"
+        "Ограничения Telegram: вопрос до 300 символов, каждый вариант до 100 символов.\n\n"
+        "Как узнать ID приватного канала:\n"
+        "1. Откройте Telegram в браузере Chrome: web.telegram.org\n"
+        "2. Откройте нужный канал\n"
+        "3. В адресной строке будет адрес вида:\n"
+        "   web.telegram.org/k/#-1001234567890\n"
+        "4. Скопируйте число после # — это и есть ID канала\n"
+        "   (например: -1001234567890)\n\n"
+        "Для публичного канала достаточно @username."
     )
 
 
@@ -870,8 +891,9 @@ def build_router(
         channel_name = await _channel_display_name(bot, channel_id)
         await m.answer(
             f"Текущий канал: {channel_name}\n\n"
-            "Создавайте тест пошагово: тема, сообщение перед тестом, вопросы по одному, затем отправка сейчас или отложенная отправка.",
-            reply_markup=_main_menu(),
+            "Используйте кнопки внизу экрана для навигации. "
+            "Нажмите «Создать тест» чтобы начать.",
+            reply_markup=_reply_menu(),
         )
 
     @router.message(Command("channel"))
@@ -1432,6 +1454,25 @@ def build_router(
             await start_builder_dialog(m, m.from_user.id)
             return
 
+        if text.lower() == "помощь":
+            await m.answer(_help_text())
+            return
+
+        if text.lower() == "сохраненные тесты":
+            await show_saved_quizzes(m, m.from_user.id)
+            return
+
+        if text.lower() == "очередь":
+            await m.answer(_scheduled_text(schedule_store))
+            return
+
+        if text.lower() == "сменить канал":
+            pending_actions.pop(m.from_user.id, None)
+            users_waiting_for_channel.add(m.from_user.id)
+            channel_id = channel_store.get(m.from_user.id) or cfg.target_channel_id
+            await _ask_channel_change(message=m, bot=bot, channel_id=channel_id)
+            return
+
         pending = pending_actions.get(m.from_user.id)
         if pending:
             mode = pending.get("mode")
@@ -1612,11 +1653,13 @@ def build_router(
                 )
                 return
 
+        parse_err: ParseError | None = None
         try:
             _parse_single_question_text(text)
-        except ParseError:
-            pass
-        else:
+        except ParseError as e:
+            parse_err = e
+
+        if parse_err is None:
             channel_id = await ensure_channel(m)
             if not channel_id:
                 pending_actions[m.from_user.id] = {
@@ -1632,9 +1675,14 @@ def build_router(
             await show_single_question_choice(m, text, channel_id)
             return
 
+        non_empty_lines = [ln for ln in text.strip().split("\n") if ln.strip()]
+        if len(non_empty_lines) >= 2:
+            await m.answer(f"Не смог разобрать вопрос: {parse_err}")
+            return
+
         await m.answer(
-            "Чтобы создать тест, нажмите «Создать тест» или отправьте /test. Вопросы теперь добавляются только по одному в этом режиме.",
-            reply_markup=_main_menu(),
+            "Чтобы создать тест — нажмите «Создать тест». "
+            "Чтобы отправить одиночный вопрос — пришлите его в формате: первая строка вопрос, дальше варианты ответов.",
         )
 
     return router
@@ -1661,10 +1709,11 @@ async def main() -> None:
         ]
     )
 
-    base_path = Path(__file__).resolve().parent.parent
-    channel_store = ChannelSelectionStore(base_path / "channel_selections.json")
-    schedule_store = ScheduledQuizStore(base_path / "scheduled_quizzes.json")
-    saved_store = SavedQuizStore(base_path / "saved_quizzes.json")
+    data_dir = Path(os.environ.get("DATA_DIR", str(Path(__file__).resolve().parent.parent)))
+    data_dir.mkdir(parents=True, exist_ok=True)
+    channel_store = ChannelSelectionStore(data_dir / "channel_selections.json")
+    schedule_store = ScheduledQuizStore(data_dir / "scheduled_quizzes.json")
+    saved_store = SavedQuizStore(data_dir / "saved_quizzes.json")
 
     for job in schedule_store.list_all():
         _schedule_job_task(bot=bot, job=job, schedule_store=schedule_store, cfg=cfg)
